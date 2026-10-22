@@ -66,6 +66,14 @@ The checksum detects transfer/file mismatches. A checksum downloaded from the sa
 
 ## 4. Run it
 
+**Only if you want the result sent to a site:** create the token file before the first run on each server. Skip this step otherwise. If the receiving site gives you a ready-made token-file line, paste that instead. Otherwise run this, paste the site's token when it waits for input (nothing is shown), and press Enter:
+
+```bash
+read -rs NOTIFY_TOKEN && install -m 600 /dev/null /root/runcloud-triage-notify.token && printf '%s\n' "$NOTIFY_TOKEN" > /root/runcloud-triage-notify.token && unset NOTIFY_TOKEN
+```
+
+The file is root-only (`0600`) and is reused by later runs, so this is a one-time step per server unless the token changes. Then add `--notify-url 'https://your-site.example/...' --notify-token-file /root/runcloud-triage-notify.token` to the run command below; see [Optional completion callback](#optional-completion-callback).
+
 Basic run on every server:
 
 ```bash
@@ -166,7 +174,7 @@ Use `--notify-url` to notify your own project when a run ends. This is an **HTTP
 
 The callback contains the hostname, run ID, timing, scan outcome, file/log counts, severity totals, coverage-gap counts, and effective read limits. It does not send application file paths, log excerpts, findings, credentials, or report attachments. Use HTTPS for remote endpoints; HTTP is available for local/private testing.
 
-For an authenticated endpoint, create a root-owned, mode `0600` or `0400` regular file containing one bearer token, for example `/root/runcloud-triage-notify.token`. Keep it outside scanned directories. Symlinks, empty tokens, internal whitespace, and files larger than 4096 bytes are rejected. A trailing newline is accepted.
+For an authenticated endpoint, create a root-owned, mode `0600` or `0400` regular file containing one bearer token, for example `/root/runcloud-triage-notify.token` (the token step at the start of step 4 does this). Keep it outside scanned directories. Symlinks, empty tokens, internal whitespace, and files larger than 4096 bytes are rejected. A trailing newline is accepted.
 
 ```bash
 /usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --notify-url 'https://your-project.example/api/triage-results' --notify-token-file /root/runcloud-triage-notify.token --notify-timeout 15
