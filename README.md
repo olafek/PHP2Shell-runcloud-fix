@@ -287,6 +287,55 @@ Explicit limits override the quick defaults regardless of argument order. For ex
 
 You can also set `--max-file-mib`, `--max-log-mib`, `--max-total-log-mib`, and `--log-samples` individually. Reducing `--log-samples` saves report output; it does not stop match counting within the inspected content. Quick mode helps most when large files/logs dominate; it still traverses all configured paths, so there is no fixed runtime guarantee. `ionice -c3`, shown above, reduces disk priority to limit server impact and can make a scan slower.
 
+### Optional PHP assessment and network alert imports
+
+Scanner **1.7.0+** offers three independent options. **All are off by default.** They can be combined with the regular scan, quick mode, callbacks and either root or user-account execution. Streambrain's Server Scans page has unchecked controls that update its foreground/background commands.
+
+| Option | Reads | Adds |
+| --- | --- | --- |
+| `--assess-php` | Installed runtime entries in `/var/lib/dpkg/status` | PHP version evidence and its limitations |
+| `--zeek-notice FILE` | Existing Zeek notice logs: JSON lines or standard tab-separated TSV | Known Corelight `PHP2SHELL::` notices |
+| `--suricata-eve FILE` | Existing Suricata EVE JSON lines | Corelight PHP2Shell signature IDs 3000650, 3000651 and 3000652 |
+
+**Optional PHP package assessment:**
+
+```bash
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --assess-php
+```
+
+This uses installed FPM, CLI, CGI, Apache module and LiteSpeed runtime package metadata, including recognized RunCloud package names. It does not run `php -v`, load extensions, execute application code or request your websites. `php-runtime.jsonl` reports the complete package version, role, advisory reference, and one of:
+
+- `below_upstream_fix`: REVIEW; check whether the vendor backported the fix.
+- `at_or_above_upstream_fix`: INFO; the numeric version meets the upstream release threshold, but this does not verify a running website or prove that files are authentic.
+- `legacy_requires_vendor_verification`: REVIEW; older branches need vendor-specific evidence, even if their version number is higher than the last official patch.
+- `unknown`: INFO; unsupported version syntax, prereleases and unlisted branches are not treated as patched.
+
+The thresholds are the official 21 October 2026 releases: PHP 8.2.35, 8.3.36, 8.4.27 and 8.5.12. Every assessment records `serving_runtime_verified: false` and a `php_serving_runtime_unverified` coverage limitation. Verify each site's pool/runtime and worker restarts separately. Containers, source builds and packages outside the recognized names are not assessed. Missing/unreadable package inventory or no recognized runtime packages produces an explicit gap and exit code `2`. A user-account run only reads this system package inventory when you select this option; it still omits the normal server-wide snapshots. [PHP advisory](https://www.php.net/archive/2026.php#2026-10-21-5)
+
+**Optional imports from sensors already installed:** replace these example paths with your actual log files. Pass either import option, or both:
+
+```bash
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --zeek-notice /opt/zeek/logs/current/notice.log --suricata-eve /var/log/suricata/eve.json
+```
+
+Paths must be readable by the invoking account and have no symlink components. Some sensor installations use a `current` symlink: pass the real dated directory instead. Repeat an option for rotated files; `.gz`, `.bz2` and `.xz` are streamed without extraction. One input path can only be assigned one sensor format. Explicit sensor inputs are inspected once and excluded from the ordinary file/log pass. Other sensor rule IDs are ignored; the ignored-record count is reported. Known alerts are imported as review indicators, without claiming that exploitation succeeded or that no other attacks occurred.
+
+Both imports use `--max-log-mib`, `--max-total-log-mib` and `--log-samples`. All inspected matches count even after the saved sample limit; the omitted count and coverage gap remain visible. Records over 1 MiB are skipped, with a coverage gap. Missing/unreadable logs and malformed or oversized records cause exit `2` rather than a misleading completed result. A byte-budget cutoff is reported as partial coverage. Sensor records are considered regardless of `--since`, like ordinary retained logs.
+
+`network-alerts.jsonl` contains selected metadata: sensor, rule, timestamp, endpoints and event identifier where available. It omits request bodies, cookies, URLs, free-form sensor messages and body samples. The default callback sends optional-check counts; `--notify-findings` also sends the selected finding metadata. The scanner creates no packet capture and installs or starts no sensor. No alerts in the imported files is not a guarantee of traffic coverage.
+
+For user mode, the same options follow your user-installed script:
+
+```bash
+/usr/bin/python3 -I "$HOME/runcloud-triage/runcloud-triage.py" --assess-php --zeek-notice "$HOME/scan-inputs/notice.log"
+```
+
+For a background command, put the options **after the scanner path and before `< /dev/null`**. Options do not change a scan that is already running. Runtime and network findings have explicit `runtime`/`network` kinds, are shown separately from file evidence in Streambrain, and **are never quarantine candidates**. They are also excluded from automatic file/folder AI dismissal and from file-hash clearances remembered across scans; an admin can still review and clear an individual result.
+
+The version-assessment idea follows [OpenAI's PHP2Shell checker](https://github.com/openai/php2shell-checker), with an independent Python implementation using the official PHP advisory. Sensor identifiers and formats follow [Corelight's PHP2Shell detections](https://github.com/corelight/php2shell-detect). The scanner does not bundle or run their Node.js, Zeek or Suricata code; Python 3.6 and the standard library remain sufficient.
+
+**Optional sensor deployment is a separate step.** Follow Corelight's installation and validation instructions if you want new network telemetry. Zeek requires 7.0+; the upstream Suricata rules were validated with 8.0.6. These sensors need HTTP visibility, including bodies; encrypted traffic needs decryption before inspection. Ordinary Nginx access logs cannot reconstruct that data, and a FastCGI connection from Nginx to PHP is not an HTTP inspection feed. Establish the traffic observation point before deploying a sensor; importing logs works without changing the web server. [Corelight setup](https://github.com/corelight/php2shell-detect#zeek), [Nginx FastCGI](https://nginx.org/en/docs/http/ngx_http_fastcgi_module.html)
+
 ### Optional completion callback
 
 Use `--notify-url` to notify your own project when a run ends. This is an **HTTP POST with JSON**, not an ICMP ping or a GET request. It is disabled unless you supply a URL.
@@ -564,7 +613,7 @@ The scanner works on older PHP and Ubuntu versions to support investigation. Its
 
 The upstream fixes announced on 21 October 2026 are PHP **8.2.35, 8.3.36, 8.4.27 and 8.5.12**. Merely moving to “PHP 8.2” is not enough. RunCloud said it would not publish patched builds for PHP 8.1 and older. PHP 8.2 itself reaches upstream end of life on 31 December 2026; account for that when planning the migration.
 
-This tool inventories installed packages and observed process paths but deliberately **does not certify patch status**. Verify which runtime each site actually serves through, vendor backport information where applicable, and whether all relevant workers were restarted. CLI PHP versions can differ from serving FPM/LSAPI versions.
+This tool inventories installed packages and observed process paths but deliberately **does not certify patch status**. The optional `--assess-php` comparison adds version evidence, while keeping the serving runtime unverified. Verify which runtime each site actually serves through, vendor backport information where applicable, and whether all relevant workers were restarted. CLI PHP versions can differ from serving FPM/LSAPI versions.
 
 Sources:
 

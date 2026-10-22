@@ -18,6 +18,7 @@ import errno
 import gzip
 import hashlib
 import http.client
+import ipaddress
 import json
 import lzma
 import os
@@ -36,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 MIB = 1024 * 1024
 # Not named runcloud-triage-* so it is never mistaken for (or globbed with) a report folder.
 QUARANTINE_DIR = "/root/runcloud-quarantine"
@@ -76,6 +77,18 @@ LOG_RULES = [
 ACCESS = re.compile(rb'^(\S+).*?\[([^\]]+)\]\s+"(\S+)\s+(\S+)[^"]*"\s+(\d{3})\b')
 CONFIG_NAMES = {".user.ini", ".htaccess", "php.ini"}
 PERSISTENCE_NAMES = {"authorized_keys", "authorized_keys2", ".bashrc", ".profile", ".bash_profile"}
+# Official PHP advisory, 2026-10-21. Version evidence alone cannot verify vendor
+# backports, the serving runtime, or whether existing workers were restarted.
+PHP_FIXED = {(8, 2): 35, (8, 3): 36, (8, 4): 27, (8, 5): 12}
+PHP_ADVISORY = "https://www.php.net/archive/2026.php#2026-10-21-5"
+ZEEK_NOTICES = {
+    "PHP_Crash_Sequence", "Multipart_Header_Flood", "Large_Form_Key",
+    "Serialized_Integer_Overflow", "Serialized_Integer_Collisions",
+    "Serialized_String_Collisions", "Serialized_Duplicate_Array",
+    "Serialized_Object_Repetition", "Potentially_Affected_PHP_Version",
+}
+SURICATA_RULES = {3000650: "Upload_Progress_Marker", 3000651: "Potentially_Affected_PHP_Header",
+                  3000652: "Potentially_Affected_PHP_Info"}
 
 
 def utc(ts):
@@ -356,9 +369,11 @@ class Report:
                 finding = {key: row[key] for key in (
                     "path", "site", "severity", "rule", "reason", "line", "byte_offset",
                     "line_or_chunk", "sha256", "content_complete", "mtime_utc", "ctime_utc",
-                    "expected_sha256", "package", "version"
+                    "expected_sha256", "package", "version", "source", "sensor_rule",
+                    "event_utc", "source_ip", "destination_ip", "source_port", "destination_port",
+                    "sensor_event_id", "assessment", "fixed_version", "serving_runtime_verified", "role"
                 ) if key in row}
-                finding["kind"] = "log" if "excerpt" in row else "file"
+                finding["kind"] = row.get("kind", "log" if "excerpt" in row else "file")
                 self.notification_findings.append(finding)
         if save and row["severity"] != "INFO" and len(self.preview) < 40:
             self.preview.append({k: row[k] for k in ("severity", "rule", "path")})
@@ -424,6 +439,7 @@ class Report:
             "scan_finished": complete, "counts": dict(self.counts),
             "indicators": dict(self.severities), "coverage_issues": dict(self.gaps),
             "sites": dict(self.sites), "options": options,
+            "optional_checks": optional_checks(self.args),
             "verdict": "REVIEW_REQUIRED" if self.severities["HIGH"] or self.severities["REVIEW"] else "NO_MATCHING_INDICATORS",
             "warning": "Not a clean bill of health. Indicators are heuristics, not proof. Review coverage and inventories.",
         }
@@ -450,6 +466,8 @@ class Report:
                   "Symlinks are inventoried but not followed. Archives are not unpacked.",
                   "Log bodies/Content-Type may be absent; a POST or a 5xx is not proof of attack.",
                   "A live scan is not atomic. Reads may update access times; command execution creates normal audit records.",
+                  "Optional checks: " + json.dumps(optional_checks(self.args)),
+                  "See php-runtime.jsonl and network-alerts.jsonl when optional checks were enabled.",
                   "Review serving FPM pools and worker restarts separately; installed packages are not proof of the running patch.",
                   "Keep this directory private. Logs and process arguments can contain secrets.", ""]
         with open(self.out / "summary.txt", "x", encoding="utf-8") as handle:
@@ -697,6 +715,247 @@ def scan_log(path, report):
         report.counts["log_bytes"] += consumed
 
 
+def optional_checks(args):
+    return {"php_assessment": args.assess_php, "zeek_notice_files": len(set(args.zeek_notice)),
+            "suricata_eve_files": len(set(args.suricata_eve))}
+
+
+def php_version_assessment(version):
+    """Assess upstream version evidence, never certify a particular vendor build."""
+    match = re.fullmatch(r"(?:\d+:)?(\d+)\.(\d+)\.(\d+)([^\s]*)", version)
+    if not match:
+        return "unknown", None
+    major, minor, patch = (int(value) for value in match.groups()[:3])
+    suffix = match.group(4)
+    if suffix and not suffix.startswith(("-", "+", "~")):
+        return "unknown", None
+    fixed = PHP_FIXED.get((major, minor))
+    if fixed is None:
+        legacy = major == 5 and 4 <= minor <= 6 or major == 7 and 0 <= minor <= 4 or major == 8 and minor <= 1
+        return ("legacy_requires_vendor_verification" if legacy else "unknown"), None
+    target = "{}.{}.{}".format(major, minor, fixed)
+    if re.search(r"(?:dev|alpha|beta|rc)", suffix, re.I):
+        return "unknown", target
+    return ("below_upstream_fix" if patch < fixed else "at_or_above_upstream_fix"), target
+
+
+def php_packages(data):
+    """Select installed PHP runtime packages, excluding libraries/extensions and meta-packages."""
+    for paragraph in data.decode("utf-8", "replace").split("\n\n"):
+        fields = {}
+        for line in paragraph.splitlines():
+            key, separator, value = line.partition(": ")
+            if separator and key in ("Package", "Version", "Status"):
+                fields[key] = value
+        if fields.get("Status") != "install ok installed":
+            continue
+        package, version = fields.get("Package", ""), fields.get("Version", "")
+        if not re.fullmatch(r"(?:php(?:\d+(?:\.\d+)?(?:rc)?)-(?:cli|fpm|cgi)|libapache2-mod-php\d+(?:\.\d+)?|lsphp\d+)", package):
+            continue
+        role = ("fpm" if package.endswith("-fpm") else "cli" if package.endswith("-cli") else
+                "cgi" if package.endswith("-cgi") else "apache" if package.startswith("libapache2") else "lsapi")
+        yield package, version[:200], role
+
+
+def assess_php(report):
+    path = "/var/lib/dpkg/status"
+    report.progress("Assessing PHP package versions", force=True)
+    report.gap("PHP runtime", "php_serving_runtime_unverified",
+               "Package versions do not verify site-to-pool mapping, vendor backports or worker restarts. No PHP executable was run.")
+    try:
+        data, _, partial = read_prefix(path, report.args.max_file_mib * MIB, report)
+        if partial:
+            report.gap(path, "php_inventory_content_limit", "Only complete package entries in the inspected prefix are assessed")
+            data = data.rsplit(b"\n\n", 1)[0] if b"\n\n" in data else b""
+        for package, version, role in php_packages(data):
+            assessment, fixed = php_version_assessment(version)
+            review = assessment in ("below_upstream_fix", "legacy_requires_vendor_verification")
+            row = {"kind": "runtime", "source": "dpkg_status", "rule": "php_runtime_version",
+                   "severity": "REVIEW" if review else "INFO", "package": package, "version": version,
+                   "role": role, "assessment": assessment, "fixed_version": fixed,
+                   "serving_runtime_verified": False,
+                   "reason": "Installed PHP package version: " + assessment + ". Verify the vendor advisory and the actual serving workers; this is not evidence of compromise."}
+            report.emit("php-runtime", dict(row, path=path, advisory=PHP_ADVISORY, advisory_date="2026-10-21"))
+            report.finding(path, row)
+            report.counts["php_packages_assessed"] += 1
+            report.counts["php_version_" + assessment] += 1
+        if not report.counts["php_packages_assessed"]:
+            report.gap(path, "php_inventory_unavailable", "No recognized installed runtime packages; custom builds and containers are not assessed")
+    except (OSError, ValueError) as exc:
+        report.gap(path, "php_inventory_unavailable", exc)
+
+
+def sensor_record(data, source):
+    """Only known Corelight identifiers and explicit metadata; never copy bodies/cookies/messages."""
+    if not isinstance(data, dict):
+        raise ValueError("Expected an object")
+    if source == "zeek":
+        note = data.get("note")
+        if not isinstance(note, str):
+            raise ValueError("Missing notice type")
+        if not note.startswith("PHP2SHELL::") or note.split("::", 1)[1] not in ZEEK_NOTICES:
+            return None
+        name = note.split("::", 1)[1]
+        runtime = name == "Potentially_Affected_PHP_Version"
+        timestamp = data.get("ts")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (str, float, int)):
+            raise ValueError("Missing notice timestamp")
+        try:
+            event_time = utc(float(timestamp))
+        except (ValueError, OverflowError, OSError):
+            raise ValueError("Invalid notice timestamp")
+        src, dst = data.get("src") or data.get("id.orig_h"), data.get("dst") or data.get("id.resp_h")
+        sport, dport = data.get("id.orig_p"), data.get("id.resp_p")
+        event_id = data.get("uid")
+        identifier = note
+    else:
+        if not isinstance(data.get("event_type"), str):
+            raise ValueError("Missing EVE event type")
+        if data["event_type"] != "alert":
+            return None
+        alert = data.get("alert")
+        if not isinstance(alert, dict):
+            raise ValueError("Missing EVE alert object")
+        sid = alert.get("signature_id")
+        if type(sid) is not int or sid not in SURICATA_RULES:
+            return None
+        name, identifier = SURICATA_RULES[sid], str(sid)
+        runtime = sid != 3000650
+        timestamp = data.get("timestamp")
+        if not isinstance(timestamp, str):
+            raise ValueError("Missing EVE timestamp")
+        try:
+            event_time = parse_time(timestamp).isoformat(timespec="seconds")
+        except argparse.ArgumentTypeError:
+            raise ValueError("Invalid EVE timestamp")
+        src, dst = data.get("src_ip"), data.get("dest_ip")
+        sport, dport = data.get("src_port"), data.get("dest_port")
+        event_id = data.get("flow_id")
+    row = {"kind": "runtime" if runtime else "network", "source": source,
+           "sensor_rule": identifier, "event_utc": event_time, "severity": "REVIEW",
+           "rule": "php_sensor_version" if runtime else "php_network_indicator",
+           "reason": ("Sensor reports potentially affected PHP version evidence. Verify the actual runtime and vendor patch; banners are not proof."
+                      if runtime else "Sensor reports " + name + "; suspicious traffic indicator, not proof of successful exploitation.")}
+    for key, value in (("source_ip", src), ("destination_ip", dst)):
+        if value not in (None, "", "-"):
+            try:
+                if not isinstance(value, str):
+                    raise ValueError("Expected an IP address string")
+                row[key] = str(ipaddress.ip_address(value))
+            except ValueError:
+                raise ValueError("Invalid sensor IP address")
+    for key, value in (("source_port", sport), ("destination_port", dport)):
+        if isinstance(value, (str, int)) and not isinstance(value, bool) and re.fullmatch(r"\d{1,5}", str(value)) and 0 <= int(value) <= 65535:
+            row[key] = int(value)
+    if isinstance(event_id, (str, int)) and not isinstance(event_id, bool) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(event_id)):
+        row["sensor_event_id"] = str(event_id)
+    return row
+
+
+def import_sensor_log(path, source, report):
+    """Bounded JSON-lines / standard tab-separated Zeek notice reader, including compressed logs."""
+    report.counts["logs"] += 1
+    report.counts["sensor_logs"] += 1
+    limit = min(report.args.max_log_mib * MIB, report.args.max_total_log_mib * MIB - report.counts["log_bytes"])
+    if limit <= 0:
+        report.gap(path, "total_log_budget_exhausted")
+        return
+    consumed, line_number, saved, matched, invalid, oversized = 0, 0, 0, 0, 0, 0
+    fields, separator_ok, discarding, capped = None, True, False, False
+    try:
+        raw, noatime = open_regular(path)
+        if not noatime:
+            report.counts["noatime_fallback_reads"] += 1
+        with raw:
+            before = os.fstat(raw.fileno())
+            suffix = path.lower()
+            stream = (gzip.GzipFile(fileobj=raw) if suffix.endswith(".gz") else
+                      bz2.BZ2File(raw) if suffix.endswith(".bz2") else
+                      lzma.LZMAFile(raw) if suffix.endswith(".xz") else raw)
+            try:
+                while consumed < limit:
+                    remaining = limit - consumed
+                    # One look-ahead byte distinguishes exact EOF from a truncated
+                    # record. Never parse a prefix of an oversized/budget-cut row.
+                    chunk = stream.readline(min(MIB + 1, remaining + 1))
+                    if not chunk:
+                        break
+                    consumed += min(len(chunk), remaining)
+                    report.progress("Importing " + source + " alerts")
+                    if not discarding:
+                        line_number += 1
+                    if len(chunk) > remaining:
+                        capped = True
+                        break
+                    if len(chunk) > MIB:
+                        if not discarding:
+                            oversized += 1
+                        discarding = not chunk.endswith(b"\n")
+                        continue
+                    if discarding:
+                        discarding = False
+                        continue
+                    if not chunk.strip():
+                        continue
+                    try:
+                        text = chunk.decode("utf-8").rstrip("\r\n")
+                        if source == "zeek" and text.startswith("#"):
+                            if text.startswith("#separator "):
+                                fields = None
+                                separator_ok = text == r"#separator \x09"
+                                if not separator_ok:
+                                    invalid += 1
+                            elif text.startswith("#fields\t"):
+                                fields = text.split("\t")[1:]
+                                if not separator_ok or "note" not in fields or "ts" not in fields or len(fields) > 100 or len(set(fields)) != len(fields):
+                                    fields = None
+                                    invalid += 1
+                            continue
+                        if source == "zeek" and not text.lstrip().startswith("{"):
+                            values = text.split("\t")
+                            if not fields or len(values) != len(fields):
+                                raise ValueError("Invalid Zeek fields")
+                            data = dict(zip(fields, values))
+                        else:
+                            data = json.loads(text)
+                        row = sensor_record(data, source)
+                    except (ValueError, TypeError, OverflowError, RecursionError):
+                        invalid += 1
+                        continue
+                    report.counts["sensor_records"] += 1
+                    if row is None:
+                        report.counts["sensor_records_ignored"] += 1
+                        continue
+                    matched += 1
+                    report.counts["sensor_indicators"] += 1
+                    save = saved < report.args.log_samples
+                    row["line_or_chunk"] = line_number
+                    report.finding(path, row, save=save)
+                    if save:
+                        report.emit("network-alerts", dict(row, path=path))
+                        saved += 1
+                if capped or consumed >= limit and stream.read(1):
+                    capped = True
+                    report.gap(path, "log_content_limit", "Sensor log inspection reached its byte budget")
+            finally:
+                if stream is not raw:
+                    stream.close()
+            after = os.fstat(raw.fileno())
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            report.gap(path, "log_changed_during_read")
+        if invalid or oversized:
+            report.gap(path, "sensor_records_invalid", "{} invalid records/headers; {} oversized or truncated lines skipped".format(invalid, oversized))
+        if matched > saved:
+            report.gap(path, "log_evidence_sample_limit", "All imported matches counted; only first samples saved")
+        report.emit("logs", dict(metadata(path, before), source=source, bytes_inspected=consumed,
+                                  lines_or_chunks=line_number, content_complete=not capped and not invalid and not oversized,
+                                  indicators=matched, evidence_samples=saved))
+    except (OSError, EOFError, ValueError) as exc:
+        report.gap(path, "sensor_log_read_error", type(exc).__name__)
+    finally:
+        report.counts["log_bytes"] += consumed
+
+
 def capture_bounded(argv, limit=8 * MIB, timeout=30):
     """Bound command output while reading, rather than after buffering all of it."""
     process = subprocess.Popen(argv, cwd="/", env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C", "TZ": "UTC"},
@@ -804,6 +1063,13 @@ def scan_targets(report, record=True):
     """Use the same scope, classification and de-duplication for both passes."""
     args = report.args
     seen = set()
+    # Explicit imports take precedence over ordinary file/log classification.
+    # Counting does not open them; missing/unreadable inputs are recorded on import.
+    for kind, paths in (("zeek", args.zeek_notice), ("suricata", args.suricata_eve)):
+        for path in paths:
+            if path not in seen:
+                seen.add(path)
+                yield path, None, kind
     roots = [args.home] + args.extra_root
     for root in roots:
         for path, st in walk_files(root, report, record=record):
@@ -867,6 +1133,8 @@ def run_scan(report):
                    "Only the selected user files and explicit extra/log roots are inspected. System snapshots, global logs, persistence and other accounts are not checked.")
     else:
         system_snapshot(report)
+    if report.args.assess_php:
+        assess_php(report)
     if not report.args.no_precount:
         report.counting = True
         report.total_items = 0
@@ -886,9 +1154,11 @@ def run_scan(report):
     for path, st, kind in scan_targets(report):
         if report.total_items is not None:
             report.total_items = max(report.total_items, report.completed_items + 1)
-        phase = "Scanning logs" if kind == "log" else "Scanning files"
+        phase = "Scanning logs" if kind in ("log", "zeek", "suricata") else "Scanning files"
         report.progress(phase)
-        if kind == "log":
+        if kind in ("zeek", "suricata"):
+            import_sensor_log(path, kind, report)
+        elif kind == "log":
             scan_log(path, report)
         else:
             scan_file(path, report, persistence=kind == "persistence", config=kind == "config")
@@ -917,6 +1187,9 @@ def parser():
     p.add_argument("--patched-at", type=parse_time, help="Optional UTC patch time; annotates mtime only, not compromise time")
     p.add_argument("--output-parent", help="Existing directory owned by you (root: private /root; user: account home, not writable by others)")
     p.add_argument("--vendor-baseline", help="Optional private JSON manifest of trusted vendor release hashes; no downloads or application code execution")
+    p.add_argument("--assess-php", action="store_true", help="Opt in: assess installed PHP runtime package versions; does not execute PHP or certify serving workers/backports")
+    p.add_argument("--zeek-notice", action="append", default=[], metavar="FILE", help="Opt in: import Corelight PHP2SHELL notices from existing Zeek JSON/TSV logs; repeatable")
+    p.add_argument("--suricata-eve", action="append", default=[], metavar="FILE", help="Opt in: import Corelight PHP2Shell alerts from existing Suricata EVE JSON logs; repeatable")
     p.add_argument("--no-precount", action="store_true", help="Start scanning sooner; omit file-count percentage and ETA")
     p.add_argument("--quick", action="store_true", help="Use smaller read/sample limits for a faster first pass; reduces coverage")
     p.add_argument("--notify-url", type=notification_url, help="POST a small JSON result summary to this HTTP(S) URL after the scan")
@@ -958,6 +1231,12 @@ def parse_options(argv=None):
         argument_parser.error("--notify-findings requires --notify-url")
     if (args.quarantine or args.restore or args.purge) and args.notify_url:
         argument_parser.error("--notify-url applies to scans, not to --quarantine/--restore/--purge")
+    if (args.quarantine or args.restore or args.purge) and (args.assess_php or args.zeek_notice or args.suricata_eve):
+        argument_parser.error("Optional PHP assessment and sensor imports apply only to scans")
+    args.zeek_notice = list(dict.fromkeys(os.path.abspath(path) for path in args.zeek_notice))
+    args.suricata_eve = list(dict.fromkeys(os.path.abspath(path) for path in args.suricata_eve))
+    if set(args.zeek_notice) & set(args.suricata_eve):
+        argument_parser.error("A sensor file must be supplied as either Zeek or Suricata, not both")
     if any(inside(os.path.abspath(args.quarantine_dir), p) for p in ("/home", "/tmp", "/var/tmp", "/dev/shm")):
         argument_parser.error("--quarantine-dir must be outside scanned trees")
     limits = {"max_file_mib": (16, 1), "max_log_mib": (512, 32),
@@ -1035,8 +1314,14 @@ def notification_payload(args, report, started, elapsed, complete, finalized, ex
         "indicators": {name: severities[name] for name in ("HIGH", "REVIEW", "INFO")},
         "coverage_issues": dict(report.gaps) if report is not None else {},
         "quick_mode": args.quick,
+        "optional_checks": optional_checks(args),
         "limits": {name: getattr(args, name) for name in ("max_file_mib", "max_log_mib", "max_total_log_mib", "log_samples")},
     }
+    if args.assess_php or args.zeek_notice or args.suricata_eve:
+        payload["optional_counts"] = {name: counts[name] for name in (
+            "php_packages_assessed", "sensor_logs", "sensor_records", "sensor_records_ignored", "sensor_indicators",
+            "php_version_below_upstream_fix", "php_version_at_or_above_upstream_fix",
+            "php_version_legacy_requires_vendor_verification", "php_version_unknown")}
     if args.notify_findings:
         findings = report.notification_findings if report is not None else []
         payload.update(findings=findings, findings_count=len(findings), findings_scope="saved_findings",
@@ -1185,7 +1470,8 @@ def quarantine_candidates(report_dir):
         flagged = collections.OrderedDict()
         for row in report_rows(dfd, "findings.jsonl"):
             # Log evidence (rows with an excerpt) points at a log, not at a file to contain.
-            if row.get("severity") not in SEVERITY_ORDER or "excerpt" in row or not isinstance(row.get("path"), str):
+            if (row.get("severity") not in SEVERITY_ORDER or "excerpt" in row
+                    or row.get("kind", "file") != "file" or not isinstance(row.get("path"), str)):
                 continue
             entry = flagged.setdefault(row["path"], {"path": row["path"], "severity": row["severity"], "rules": []})
             if SEVERITY_ORDER[row["severity"]] < SEVERITY_ORDER[entry["severity"]]:
@@ -1577,7 +1863,8 @@ def main():
             report.gap("scan", "unexpected_error", f"{type(exc).__name__}: {exc}")
         report.finish(complete)
         finalized = True
-        if complete and not any(key in report.gaps for key in ("root_unavailable", "directory_read_error", "traversal_error", "file_read_error", "log_read_error")):
+        if complete and not any(key in report.gaps for key in ("root_unavailable", "directory_read_error", "traversal_error", "file_read_error", "log_read_error",
+                                                             "sensor_log_read_error", "sensor_records_invalid", "php_inventory_unavailable")):
             exit_code = 1 if report.severities["HIGH"] or report.severities["REVIEW"] else 0
     except (OSError, ValueError) as exc:
         if report is not None:
