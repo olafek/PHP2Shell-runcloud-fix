@@ -84,8 +84,7 @@ https://gist.githubusercontent.com/Sairahcaz/2c22b4a68fd5b75e410c7f9f69f485a0/ra
 ### Download it
 
 ```bash
-curl -fsSL -o php2shell-triage.sh \
-  https://gist.githubusercontent.com/Sairahcaz/2c22b4a68fd5b75e410c7f9f69f485a0/raw/php2shell-triage.sh
+curl -fsSL -o php2shell-triage.sh https://gist.githubusercontent.com/Sairahcaz/2c22b4a68fd5b75e410c7f9f69f485a0/raw/php2shell-triage.sh
 ```
 
 ### Read it before running it

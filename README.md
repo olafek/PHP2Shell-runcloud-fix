@@ -39,7 +39,7 @@ apt-get install --no-install-recommends python3 curl ca-certificates
 
 ## 3. Download inside the SSH session
 
-Run these commands as root. Keep the scanner outside website directories.
+Run these commands as root, one line at a time. Each command is complete on its own line. Keep the scanner outside website directories.
 
 ```bash
 install -d -o root -g root -m 0700 /root/runcloud-triage
@@ -49,18 +49,18 @@ umask 077
 TRIAGE_REF='8d0c97adf7ff00d0a511a34c8d2c35f85f5e2ffe'
 TRIAGE_RAW_BASE="https://raw.githubusercontent.com/olafek/PHP2Shell-runcloud-fix/$TRIAGE_REF"
 
-curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
-  "$TRIAGE_RAW_BASE/runcloud-triage.py" -o runcloud-triage.py
-curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
-  "$TRIAGE_RAW_BASE/runcloud-triage.py.sha256" -o runcloud-triage.py.sha256
+curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py" -o runcloud-triage.py
+
+curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py.sha256" -o runcloud-triage.py.sha256
 
 sha256sum --check runcloud-triage.py.sha256
+
 chmod 0600 runcloud-triage.py runcloud-triage.py.sha256
 ```
 
 **Continue to step 4 only if both downloads succeeded and the checksum says `OK`.** Do not pipe the remote script into a root shell. No executable bit, service installation, cron job, pip package, or PHP extension is required.
 
-**Optional code review:** `less runcloud-triage.py` opens the source code for inspection; it does not run the scanner. Press `q` to exit and continue to step 4. You do not need to edit the file or open it in `nano`.
+**Optional code review:** `less runcloud-triage.py` displays the source code; it does not run the scanner. Press `q` to exit and continue to step 4. You do not need to edit the file or open it in `nano`.
 
 The checksum detects transfer/file mismatches. A checksum downloaded from the same repository is **not independent authentication** of that repository.
 
@@ -70,8 +70,10 @@ Basic run on every server:
 
 ```bash
 /usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py
+
 TRIAGE_EXIT=$?
-printf 'Triage exit code: %s\n' "$TRIAGE_EXIT"
+
+echo "Triage exit code: $TRIAGE_EXIT"
 ```
 
 `-I` isolates Python from the current directory and Python environment variables. The script lowers its own CPU priority. On a busy server, you can also give its disk reads idle I/O priority if `ionice` is installed:
@@ -83,9 +85,7 @@ ionice -c3 /usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py
 For the October incident, choose a recent-file inventory window and optionally supply **that server's actual patch/worker-restart time**:
 
 ```bash
-/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py \
-  --since '2026-10-01T00:00:00Z' \
-  --patched-at '2026-10-21T16:00:00Z'
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --since '2026-10-01T00:00:00Z' --patched-at '2026-10-21T16:00:00Z'
 ```
 
 The patch time above is an **example**, not an assumed time for your servers. Omit it when unknown. All displayed file times are UTC. `+02:00` timestamps are also accepted. A bare date is interpreted as midnight UTC.
@@ -116,23 +116,23 @@ less "$TRIAGE_REPORT/coverage.jsonl"
 
 Files are created only when there are records for them, so some files may be absent. JSONL means one JSON object per line; strings are escaped so filenames or log content cannot create fake report lines.
 
-| File | What to review |
-| --- | --- |
-| `summary.txt` | Completion status, overall counts, site/scope counts, coverage issues and first 40 non-INFO indicators. |
-| `summary.jsonl` | The same summary in machine-readable form, including options and times. |
-| `findings.jsonl` | File rule matches and sampled log evidence, with severity and explanation. File matches include line numbers where available and hashes of fully read files. |
-| `coverage.jsonl` | Unreadable files, failed commands, limits, archives not unpacked, and other incomplete checks. Read this even when no suspicious indicators were found. |
-| `files.jsonl` | Metadata for inspected non-log files: path, owner IDs, mode, size, modification/change time, PHP-candidate status and hash. Partial reads have a labelled prefix hash, never a misleading full-file hash. |
-| `recent-files.jsonl` | Files with modification or inode-change time since `--since`. Deployments, updates and cache activity normally produce many entries. |
-| `logs.jsonl` | Logs inspected, decompressed bytes read, indicator counts, sampled-evidence counts, access-log time range when parseable, and completeness. |
-| `traffic.jsonl` | POST requests and 5xx responses grouped by UTC hour, logged client IP, method, endpoint and status. Query strings are omitted from aggregation keys. |
-| `persistence.jsonl` | Cron, local systemd configuration, authorized keys and selected startup-file inventories. Command-bearing text and public SSH-key entries are included for manual review. |
-| `configuration.jsonl` | Configuration metadata and selected web-root, FPM/socket, logging and PHP directives. This is an inventory, not a complete effective-configuration parser. |
-| `symlinks.jsonl` | Links and their targets. Links are not followed; inspect external targets separately. |
-| `process-executables.jsonl` | Observed web-process executable paths and temporary-location executables from `/proc`. |
-| `snapshot-*.txt` | Current processes, sockets, timers, unit files, installed PHP packages, recent SSH logins and a bounded journal snapshot. Review these manually. |
-| `scanner.jsonl` | Scanner version and its own SHA-256. |
-| `SHA256SUMS` | Checksums for completed report artifacts, useful after transfer. They are not a forensic signature from a trusted third party. |
+| File                        | What to review                                                                                                                                                                                            |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `summary.txt`               | Completion status, overall counts, site/scope counts, coverage issues and first 40 non-INFO indicators.                                                                                                   |
+| `summary.jsonl`             | The same summary in machine-readable form, including options and times.                                                                                                                                   |
+| `findings.jsonl`            | File rule matches and sampled log evidence, with severity and explanation. File matches include line numbers where available and hashes of fully read files.                                              |
+| `coverage.jsonl`            | Unreadable files, failed commands, limits, archives not unpacked, and other incomplete checks. Read this even when no suspicious indicators were found.                                                   |
+| `files.jsonl`               | Metadata for inspected non-log files: path, owner IDs, mode, size, modification/change time, PHP-candidate status and hash. Partial reads have a labelled prefix hash, never a misleading full-file hash. |
+| `recent-files.jsonl`        | Files with modification or inode-change time since `--since`. Deployments, updates and cache activity normally produce many entries.                                                                      |
+| `logs.jsonl`                | Logs inspected, decompressed bytes read, indicator counts, sampled-evidence counts, access-log time range when parseable, and completeness.                                                               |
+| `traffic.jsonl`             | POST requests and 5xx responses grouped by UTC hour, logged client IP, method, endpoint and status. Query strings are omitted from aggregation keys.                                                      |
+| `persistence.jsonl`         | Cron, local systemd configuration, authorized keys and selected startup-file inventories. Command-bearing text and public SSH-key entries are included for manual review.                                 |
+| `configuration.jsonl`       | Configuration metadata and selected web-root, FPM/socket, logging and PHP directives. This is an inventory, not a complete effective-configuration parser.                                                |
+| `symlinks.jsonl`            | Links and their targets. Links are not followed; inspect external targets separately.                                                                                                                     |
+| `process-executables.jsonl` | Observed web-process executable paths and temporary-location executables from `/proc`.                                                                                                                    |
+| `snapshot-*.txt`            | Current processes, sockets, timers, unit files, installed PHP packages, recent SSH logins and a bounded journal snapshot. Review these manually.                                                          |
+| `scanner.jsonl`             | Scanner version and its own SHA-256.                                                                                                                                                                      |
+| `SHA256SUMS`                | Checksums for completed report artifacts, useful after transfer. They are not a forensic signature from a trusted third party.                                                                            |
 
 ### Severities and verdicts
 
@@ -146,11 +146,11 @@ Log evidence excerpts are sampled per file to keep reports manageable. Counts co
 
 ### Exit codes
 
-| Code | Meaning |
-| --- | --- |
-| `0` | Scan finished without a hard read/traversal failure and no HIGH/REVIEW indicators were counted. Coverage limits may still exist. |
-| `1` | Scan finished and HIGH/REVIEW indicators were counted. This is a review signal, not a scanner crash. |
-| `2` | Invalid invocation, initialization failure, interrupted/unexpected failure, or a file/log/traversal read failure. Any available report is partial and needs review. |
+| Code | Meaning                                                                                                                                                             |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0`  | Scan finished without a hard read/traversal failure and no HIGH/REVIEW indicators were counted. Coverage limits may still exist.                                    |
+| `1`  | Scan finished and HIGH/REVIEW indicators were counted. This is a review signal, not a scanner crash.                                                                |
+| `2`  | Invalid invocation, initialization failure, interrupted/unexpected failure, or a file/log/traversal read failure. Any available report is partial and needs review. |
 
 Missing inspection commands, byte/sample limits, unexpanded archives and external symlink targets are recorded in coverage; **exit code alone is never a coverage guarantee**.
 
@@ -173,19 +173,13 @@ It also inspects `/tmp`, `/var/tmp`, `/dev/shm`, common cron/startup/local-syste
 Default limits are **16 MiB per non-log file**, **512 MiB of decompressed content per log**, **8 GiB of decompressed log content in total**, and **200 saved indicator excerpts per log**. Content limits inspect the beginning of a file and record the gap; they do not claim to inspect the remainder. Traversal order is not chronological. Large old logs can consume the log budget before other files are reached. Review coverage and rerun with larger limits or targeted log paths when needed:
 
 ```bash
-/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py \
-  --max-file-mib 64 \
-  --max-log-mib 2048 \
-  --max-total-log-mib 32768 \
-  --log-samples 1000
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --max-file-mib 64 --max-log-mib 2048 --max-total-log-mib 32768 --log-samples 1000
 ```
 
 Symlinks are recorded rather than followed, and devices/FIFOs/sockets are never read as files. A release symlink whose real target is under `/home` is covered by the normal traversal of that target. Add actual external deployment directories or custom log paths explicitly:
 
 ```bash
-/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py \
-  --extra-root /srv/myapp/releases \
-  --log-root /srv/myapp/logs
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --extra-root /srv/myapp/releases --log-root /srv/myapp/logs
 ```
 
 `--extra-root` and `--log-root` can be repeated. Use actual paths without symlink components. Log directories are searched for common log filenames; pass a custom-named log file directly with `--log-root` if necessary. Compressed application archives/backups are not unpacked.
