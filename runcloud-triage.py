@@ -241,8 +241,11 @@ class Report:
 
     def progress(self, phase):
         if time.time() - self.last_progress > 15:
-            print(f"[{utc(time.time())}] {phase}: {self.counts['files']} files, "
-                  f"{self.counts['logs']} logs, {sum(self.severities.values())} indicators", flush=True)
+            print(f"[{utc(time.time())}] {phase} | Scan attempts so far: "
+                  f"{self.counts['files']:,} non-log files, {self.counts['logs']:,} log files | "
+                  f"Rule matches: {sum(self.severities.values()):,} "
+                  f"(HIGH={self.severities['HIGH']:,}, REVIEW={self.severities['REVIEW']:,}, "
+                  f"INFO={self.severities['INFO']:,}) | Matches are not confirmed infections", flush=True)
             self.last_progress = time.time()
 
     def finish(self, complete):

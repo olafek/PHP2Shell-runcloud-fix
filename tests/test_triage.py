@@ -80,6 +80,26 @@ class DetectionTests(unittest.TestCase):
         ast.parse(SCRIPT.read_text(encoding="utf-8"), feature_version=(3, 6))
 
 
+class ProgressTests(unittest.TestCase):
+    def test_progress_includes_repeated_unsaved_matches_and_severity(self):
+        report = triage.Report("unused", argparse.Namespace(home="/home"))
+        report.counts.update(files=12456, logs=40)
+        # Two lines in the same log each match both REVIEW and INFO rules.
+        # Unsaved evidence still contributes to the live totals.
+        events, _ = triage.log_event(b"PHP Fatal error: Allowed memory size of 1 byte exhausted\n")
+        for _ in range(2):
+            for event in events:
+                report.finding("/home/example/error.log", event, save=False)
+        with mock.patch("builtins.print") as output:
+            report.progress("Scanning logs")
+        message = output.call_args[0][0]
+        self.assertIn("12,456 non-log files, 40 log files", message)
+        self.assertIn("Rule matches: 4", message)
+        self.assertIn("HIGH=0, REVIEW=2, INFO=2", message)
+        self.assertIn("not confirmed infections", message)
+        self.assertFalse(report.handles)
+
+
 @unittest.skipUnless(sys.platform.startswith("linux"), "Filesystem tests require Linux")
 class LinuxFixtureTests(unittest.TestCase):
     def setUp(self):

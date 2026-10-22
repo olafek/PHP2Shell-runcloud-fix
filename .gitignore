@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 runcloud-triage-*/
 snapshot-*.txt
+
+docs/
+AGENTS.md

@@ -10,7 +10,7 @@ This is a first-pass investigation tool for the PHP vulnerabilities announced on
 
 The public repository is [olafek/PHP2Shell-runcloud-fix](https://github.com/olafek/PHP2Shell-runcloud-fix). The steps below use `curl` inside your server's SSH session to download the scanner and its checksum. No Git installation, repository clone, or GitHub login is needed.
 
-The download example pins commit `8d0c97adf7ff00d0a511a34c8d2c35f85f5e2ffe` so every server receives the same scanner version. To download the latest published version instead, set `TRIAGE_REF='master'` in step 3; that branch can change between runs.
+The download example uses `master` to get the latest published scanner. That branch can change between runs. To use the same scanner version on every server, replace `master` in `TRIAGE_REF` in step 3 with the same full commit hash from the repository.
 
 ## 2. Log in and check requirements
 
@@ -46,7 +46,7 @@ install -d -o root -g root -m 0700 /root/runcloud-triage
 cd /root/runcloud-triage
 umask 077
 
-TRIAGE_REF='8d0c97adf7ff00d0a511a34c8d2c35f85f5e2ffe'
+TRIAGE_REF='master'
 TRIAGE_RAW_BASE="https://raw.githubusercontent.com/olafek/PHP2Shell-runcloud-fix/$TRIAGE_REF"
 
 curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py" -o runcloud-triage.py
@@ -96,6 +96,27 @@ The patch time above is an **example**, not an assumed time for your servers. Om
 - `--patched-at` labels a file's modification time as before/after the supplied time. It does not determine when an attacker gained access; `ctime` is inode-change time, not creation time.
 
 The terminal prints the exact report directory and progress about every 15 seconds while it is doing file/log work. Large servers can take a long time: it reads files across `/home`, including media, dependencies and old releases. Keep the SSH session open or use an existing `tmux`/`screen` session. Ctrl+C attempts to save a clearly marked partial report; a killed process or full disk may prevent finalization.
+
+### Reading the progress line
+
+Older versions display a line such as `Scanning files: 12456 files, 40 logs, 123 indicators`. These are cumulative totals for the current run, not a count of infected files:
+
+- **Scanning files:** the scanner's current activity. It can switch between file and log inspection as it walks the server.
+- **12,456 files:** non-log file scan attempts so far, including application code, dependencies, uploads, configuration, and other files in scope.
+- **40 logs:** log files attempted, including rotated/compressed logs; this is not the number of log entries. The currently open log is included.
+- **123 indicators:** rule matches counted so far across all severities. One file can match several rules, and repeated log messages can contribute many matches. The total includes informational events and does not mean 123 infections or attacks.
+
+Updated versions make these labels explicit and show the severity breakdown. For example, an illustrative split of those 123 matches is:
+
+```text
+[2026-10-22T12:00:00+00:00] Scanning files | Scan attempts so far: 12,456 non-log files, 40 log files | Rule matches: 123 (HIGH=3, REVIEW=20, INFO=100) | Matches are not confirmed infections
+```
+
+**HIGH** means prioritise source review; **REVIEW** means investigate the context; **INFO** supplies context, such as ordinary PHP fatal errors or successful SSH logins. Even HIGH matches can come from legitimate code or test fixtures. The old progress line does not reveal how its total is split.
+
+File/log counts include failed or partial attempts and logs skipped after the total log byte budget is reached. Check `coverage.jsonl` for those gaps. Totals can increase while the same log is open, and the scanner does not calculate a percentage complete or time remaining. Indicator counts also continue after the per-log evidence sample limit, so they can exceed the number of entries saved in `findings.jsonl`.
+
+Let the scan finish, then read `summary.txt` for completion and severity totals, `findings.jsonl` for saved matches and their paths, and `coverage.jsonl` for gaps, where present. A scan already running keeps its original progress format; there is no need to interrupt it for this display change.
 
 ## 5. Understand the report
 
@@ -236,7 +257,7 @@ python3 -m py_compile runcloud-triage.py
 
 Linux filesystem fixtures test symlink/FIFO handling, age-independent coverage, report generation, compressed logs, limits and read failures. Detection and timestamp tests can also run on Windows; Linux-specific tests are skipped there. Python 3.6 grammar is checked on interpreters that provide AST grammar selection. Testing on a newer interpreter does not substitute for an end-to-end trial on your oldest server image.
 
-Validation for this version: **24 tests passed on Linux with Python 3.10.12**, including an isolated full command-line run exercising exit codes 0/1/2 and report permissions, plus output and timeout limits. Python 3.6 syntax and the APIs used for older-Ubuntu compatibility were checked; an actual Ubuntu 18.04/Python 3.6 runtime was not available for execution here.
+Validation for this version: **25 tests passed on Linux with Python 3.10.12**, including an isolated full command-line run exercising exit codes 0/1/2 and report permissions, output and timeout limits, and progress totals for repeated matches whose evidence is not saved. Python 3.6 syntax and the APIs used for older-Ubuntu compatibility were checked; an actual Ubuntu 18.04/Python 3.6 runtime was not available for execution here.
 
 ### Publishing updates
 
@@ -255,4 +276,4 @@ $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath ./runcloud-triage.py).Has
 "$digest  runcloud-triage.py" | Set-Content -Encoding ascii ./runcloud-triage.py.sha256
 ```
 
-Preserve the script's bytes when uploading; line-ending changes change its checksum. `.gitattributes` keeps consistent LF line endings across workstations. After a new scanner commit is published, update the pinned `TRIAGE_REF` and matching version description above to that commit when it should become the documented default.
+Preserve the script's bytes when uploading; line-ending changes change its checksum. `.gitattributes` keeps consistent LF line endings across workstations. Publish scanner and checksum updates together. For pinned deployments, select a commit containing both matching files.
