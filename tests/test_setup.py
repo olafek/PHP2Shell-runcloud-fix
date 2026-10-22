@@ -90,6 +90,23 @@ class SetupTests(unittest.TestCase):
                 self.assertFalse((self.root / "chmod-called").exists())
 
 
+    def test_user_setup_works_with_spaces_in_home_in_bash_and_sh(self):
+        section = self.readme.split("### Run as a RunCloud user without root", 1)[1]
+        blocks = re.findall(r"```bash\n(.*?)\n```", section, re.S)
+        for shell in ("/bin/bash", "/bin/sh"):
+            directory = self.root / (Path(shell).name + " account space")
+            directory.mkdir()
+            environment = dict(self.env, HOME=str(directory))
+            command = " ".join(blocks[0].splitlines()) + " " + blocks[2]
+            result = subprocess.run([shell, "-c", command], env=environment, input=b"fixture-token\n",
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertIn(b"OK", result.stdout)
+            self.assertEqual((directory / "runcloud-triage-notify.token").read_text(), "fixture-token\n")
+            self.assertEqual(stat.S_IMODE((directory / "runcloud-triage").stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE((directory / "runcloud-triage-notify.token").stat().st_mode), 0o600)
+
+
 @unittest.skipUnless(sys.platform.startswith("linux"), "Background launch tests require Linux")
 class BackgroundTests(unittest.TestCase):
     def test_background_run_survives_hangup_and_records_private_logs_and_exit_codes(self):
@@ -97,11 +114,17 @@ class BackgroundTests(unittest.TestCase):
         command = re.search(r"```bash\n(.*?)\n```", readme, re.S).group(1)
         self.check_background_command(command)
 
+    def test_user_background_run_survives_hangup_with_spaces_in_home(self):
+        section = README.read_text(encoding="utf-8").split("### Run as a RunCloud user without root", 1)[1]
+        command = re.findall(r"```bash\n(.*?)\n```", section, re.S)[3]
+        self.check_background_command(command)
+
     def check_background_command(self, command, expected_args=None):
         # A harmless Python fixture replaces the scanner; no host scan or callback runs.
         with tempfile.TemporaryDirectory(prefix="triage-background-test-") as directory:
-            root = Path(directory)
-            scanner = root / "scanner.py"
+            root = Path(directory) / "account space"
+            scanner = root / "runcloud-triage/runcloud-triage.py"
+            scanner.parent.mkdir(parents=True)
             scanner.write_text(
                 "import json, os, sys, time\n"
                 "assert sys.stdin.read() == ''\n"
@@ -113,10 +136,10 @@ class BackgroundTests(unittest.TestCase):
                 "print('fixture finished', flush=True)\n"
                 "sys.exit(int(os.environ['FIXTURE_EXIT']))\n"
             )
-            command = command.replace("/root/runcloud-background.", str(root / "runcloud-background."))
+            command = command.replace("/root/runcloud-background.XXXXXX", shlex.quote(str(root / "runcloud-background.XXXXXX")))
             command = command.replace("/usr/bin/python3", shlex.quote(sys.executable))
             command = command.replace("/root/runcloud-triage/runcloud-triage.py", shlex.quote(str(scanner)))
-            environment = dict(os.environ)
+            environment = dict(os.environ, HOME=str(root))
             if expected_args is not None:
                 environment['FIXTURE_ARGS'] = json.dumps(expected_args)
             jobs = set()

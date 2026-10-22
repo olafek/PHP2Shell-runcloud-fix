@@ -200,14 +200,15 @@ def mask_php_comments(data):
                         rb'"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`|'
                         rb"/\*[\s\S]*?(?:\*/|\Z)|//[^\r\n]*(?:\r?\n|\Z)|\#(?!\[)[^\r\n]*(?:\r?\n|\Z)", re.I)
     masked = bytearray(data)
+    opening_tag = re.compile(rb"<\?(?:php\b|=)?", re.I)
     in_php = False
     position = 0
     while position < len(data):
         if not in_php:
-            opening = re.search(rb"<\?(?:php\b|=)?", data[position:], re.I)
+            opening = opening_tag.search(data, position)
             if not opening:
                 break
-            position += opening.end()
+            position = opening.end()
             in_php = True
         match = tokens.search(data, position)
         if not match:

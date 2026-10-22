@@ -1,6 +1,6 @@
 # RunCloud incident triage
 
-A standalone, read-only triage script for **RunCloud on Ubuntu 18.04 and newer**, including servers running **PHP 7.4 and newer**. It runs as root, inspects sites throughout `/home`, and writes a private report for each server. The scan itself never changes files: flagged files are moved into a root-only quarantine only when you choose them at the terminal, and can be restored (see [step 6](#6-quarantine-restore-or-delete-flagged-files)).
+A standalone, read-only triage script for **RunCloud on Ubuntu 18.04 and newer**, including servers running **PHP 7.4 and newer**. As root it inspects sites throughout `/home`; as an ordinary RunCloud user it inspects that account's `webapps` directory. Both modes write a private report. The scan itself never changes files: flagged files are moved into a root-only quarantine only when you choose them at the terminal, and can be restored (see [step 6](#6-quarantine-restore-or-delete-flagged-files)).
 
 **It requires Python 3.6 or newer. It does not require, execute, upgrade, or modify PHP.** It uses only Python's standard library and does not install Python packages. By default it makes no network requests or uploads. Optional `--notify-url` sends a small JSON result summary to an endpoint you choose; add `--notify-findings` to include every saved finding's path and review metadata.
 
@@ -153,6 +153,20 @@ cat /root/runcloud-background.a1B2c3/exit-code
 
 The configured completion callback still runs. Background scans have no interactive terminal and cannot prompt to quarantine files. Review the report after completion, then use `--quarantine REPORT_DIR` in a new interactive SSH session if needed. Do not start another scan just because the original SSH session closed.
 
+**Reopen the quarantine prompt after a root background scan:** wait until `exit-code` appears, reconnect as root and find the report path in that run's log (replace `a1B2c3` with your saved background folder):
+
+```bash
+grep -m1 '^Writing private report to:' /root/runcloud-background.a1B2c3/scan.log
+```
+
+Use the printed **report** directory, not the background-log folder:
+
+```bash
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --quarantine /root/runcloud-triage-SERVER-20261022T120000Z-a1b2c3d4
+```
+
+This reads the saved findings and opens the interactive selection/confirmation prompt without rescanning. Nothing moves until you choose files and confirm. No candidates means there is nothing to select. Review dependency files against their release before quarantining them.
+
 ### Run as a RunCloud user without root
 
 Scanner **1.6.0+** also runs as an ordinary RunCloud SSH user. Use the same script; no sudo or separate edition is needed. Log in as the account that owns the websites. Check `/usr/bin/python3 --version` (3.6+) and `command -v curl`; ask the server administrator to install missing prerequisites.
@@ -283,7 +297,7 @@ Use `--notify-url` to notify your own project when a run ends. This is an **HTTP
 
 By default, the callback contains the hostname, run ID, timing, scan outcome, file/log counts, severity totals, coverage-gap counts, and effective read limits. This summary does not send application file paths, log excerpts, findings, credentials, or report attachments. Use HTTPS for remote endpoints; HTTP is available for local/private testing.
 
-For an authenticated endpoint, create a root-owned, mode `0600` or `0400` regular file containing one bearer token, for example `/root/runcloud-triage-notify.token` (the token step at the start of step 4 does this). Keep it outside scanned directories. Symlinks, empty tokens, internal whitespace, and files larger than 4096 bytes are rejected. A trailing newline is accepted.
+For an authenticated endpoint, create a mode `0600` or `0400` regular file owned by the account running the scanner and containing one bearer token. The root example is `/root/runcloud-triage-notify.token` (the token step at the start of step 4 does this); user mode uses `$HOME/runcloud-triage-notify.token`. Keep it outside scanned directories. Symlinks, empty tokens, internal whitespace, and files larger than 4096 bytes are rejected. A trailing newline is accepted.
 
 ```bash
 /usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --notify-url 'https://your-project.example/api/triage-results' --notify-token-file /root/runcloud-triage-notify.token --notify-timeout 15
@@ -361,7 +375,7 @@ In your project, accept a POST with `Content-Type: application/json; charset=utf
 
 Check `status`, `scan_finished`, and `report_finalized` together. For example, traversal can finish with read failures (`scan_finished: true`, `status: incomplete`). An initialization failure may have `run_id: null` and no report. A `NO_MATCHING_INDICATORS` verdict on an incomplete run does not establish safety.
 
-The scanner makes **one delivery attempt**, normally after report finalization, including runs with no indicators. It also attempts a failure callback for initialization/finalization errors or a handled Ctrl+C. Invalid arguments, an unreadable token file, failure of the Linux/root prerequisite, a forced kill, or a server outage can prevent any callback.
+The scanner makes **one delivery attempt**, normally after report finalization, including runs with no indicators. It also attempts a failure callback for initialization/finalization errors or a handled Ctrl+C. Invalid arguments, an unreadable token file, failure of the Linux prerequisite, a forced kill, or a server outage can prevent any callback. Callbacks include `scan_scope` (`system` or `user`) and `effective_uid`; user mode always includes the `user_scope_only` coverage limitation once scanning starts.
 
 `--notify-timeout` sets a 1–60 second delivery deadline (default **10 seconds**) on Linux. Redirects are refused, environment proxy settings are ignored, and HTTPS certificate verification remains enabled. A delivery failure prints a separate message without changing the scan's exit code or local report. There are no automatic retries; a lost response can mean the receiver accepted a request even though delivery is reported as failed. Treat this as a best-effort completion notification, not a guaranteed heartbeat.
 
@@ -373,7 +387,7 @@ Each run creates a unique directory such as:
 /root/runcloud-triage-SERVER-20261022T120000Z-a1b2c3d4/
 ```
 
-The directory is mode `0700`; report files are private to root. Existing reports are not overwritten. Copy the exact path printed by the scanner:
+The directory is mode `0700`; report files are private to the account that ran the scan (root for the server-wide examples). Existing reports are not overwritten. Copy the exact path printed by the scanner:
 
 ```bash
 TRIAGE_REPORT='/root/runcloud-triage-SERVER-20261022T120000Z-a1b2c3d4'
@@ -524,7 +538,7 @@ Symlinks are recorded rather than followed, and devices/FIFOs/sockets are never 
 
 Containers and custom RunCloud stacks may store files, logs, or effective configuration outside these paths or inside a different namespace. Host-visible `/home` content is scanned, but the script **does not enter containers**, query the RunCloud API, or assert that every configured domain/runtime was discovered. Inventory such locations and provide their host-visible paths or investigate inside the appropriate environment separately.
 
-No database audit, memory capture, rootkit detection, independent file-baseline comparison, or complete historical authentication/persistence audit is performed. The script intentionally does not run Git, Artisan, Composer, WP-CLI, PHP binaries or application commands as root. Local tools and logs can be misleading if the host itself is compromised.
+No database audit, memory capture, rootkit detection or complete historical authentication/persistence audit is performed. Independent vendor comparison requires the optional trusted manifest described above; other files have no baseline verification. The script intentionally does not run Git, Artisan, Composer, WP-CLI, PHP binaries or application commands. Local tools and logs can be misleading if the host itself is compromised.
 
 The script writes only its new report directory. It does not alter website content, settings, users, services or jobs, delete/quarantine files, or restart workers. As with other live triage, directory/file reads can affect access times, commands generate normal audit records, and concurrent changes mean this is not an atomic forensic image. It requests no-atime file reads where supported and reports fallback counts.
 
@@ -574,14 +588,15 @@ python3 -m py_compile runcloud-triage.py
 
 Linux filesystem fixtures test symlink/FIFO handling, age-independent coverage, report generation, compressed logs, limits and read failures. `tests/test_setup.py` checks the README commands in Bash and `/bin/sh` with offline download fixtures, including pasted command boundaries, private permissions, failed downloads and checksum mismatches. Its background fixture verifies that jobs continue after the launching shell exits and a hangup signal arrives, detach all terminal streams, and save exit codes 0/1/2. Run the tests as root in a disposable Linux environment. Detection and timestamp tests can also run on Windows; Linux-specific tests are skipped there. Python 3.6 grammar is checked on interpreters that provide AST grammar selection.
 
-Validation for this version: **74 tests passed on Ubuntu 22.04 (WSL) with Python 3.10.12**, including chance PHP-tag bytes in binary images versus readable PHP hidden in images, isolated command-line runs exercising exit codes 0/1/2, report permissions, quick mode, and callbacks for completed/partial/interrupted runs; counting and ETA; notification authentication, redirects, deadlines, full findings beyond the preview limit, omitted-match counts, evidence filtering, and failure handling; and quarantine selection, hash/size matching, symlinked folders, hard links, exact restore of owner/mode/timestamps, refusal to overwrite, purge confirmation, the action log, and refusal without an interactive terminal. Notification transport tests use a local HTTP receiver and do not contact external services.
+Version 1.6.0 validation includes the Symfony documentation regression and executable calls at the same vendor path, trusted vendor baseline matches/mismatches/unverified coverage, and a complete CLI run after dropping privileges to an ordinary account in an isolated filesystem. The suite also covers binary PHP-tag heuristics, scan exit codes 0/1/2, report permissions, counting/ETA, callback privacy/failures, background hangup handling, setup commands with spaces in home paths, and the existing quarantine safeguards. Notification transport tests use a local HTTP receiver and do not contact external services.
 
 Older-runtime validation used packages verified against signed Ubuntu archive metadata in isolated chroots under WSL:
 
 | Ubuntu userspace | Python | Test result |
 | --- | --- | --- |
-| 18.04 | 3.6.9 | 73 passed; 1 skipped (AST grammar selection needs Python 3.8+) |
-| 20.04 | 3.8.10 | 74 passed |
+| 22.04 (WSL) | 3.10.12 | 82 passed |
+| 18.04 | 3.6.9 | 81 passed; 1 skipped (AST grammar selection needs Python 3.8+) |
+| 20.04 | 3.8.10 | 82 passed |
 
 Both also passed isolated `--help` and Bash/`/bin/sh` setup checks. Ubuntu's curl 7.58.0 and 7.68.0 accept the download options used here. This validates the older userspace and Python APIs; each server's RunCloud configuration, kernel and external HTTPS endpoint still need on-host validation.
 
