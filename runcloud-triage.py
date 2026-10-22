@@ -3,29 +3,36 @@
 
 Run with /usr/bin/python3 -I. Never imports or executes application code.
 Only writes to a newly created private report directory. See README.md.
+Optional --notify-url posts a small result summary to your own HTTP(S) endpoint.
 """
 
 import argparse
 import bz2
 import collections
+from contextlib import contextmanager
 import datetime as dt
 import errno
 import gzip
 import hashlib
+import http.client
 import json
 import lzma
 import os
 from pathlib import Path
 import re
 import selectors
+import shutil
+import signal
 import socket
 import stat
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 MIB = 1024 * 1024
 UTC = dt.timezone.utc
 PHP_EXT = re.compile(r"\.(?:php\d*|phtml|pht|phar|inc)(?:\.|$)", re.I)
@@ -90,6 +97,28 @@ def bounded_int(value):
     value = int(value)
     if value <= 0:
         raise argparse.ArgumentTypeError("Must be positive")
+    return value
+
+
+def notification_url(value):
+    try:
+        if any(ord(char) <= 32 or ord(char) == 127 for char in value):
+            raise ValueError()
+        parsed = urllib.parse.urlsplit(value)
+        if (parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.fragment
+                or parsed.username is not None or parsed.password is not None):
+            raise ValueError()
+        if parsed.port is not None and not 1 <= parsed.port <= 65535:
+            raise ValueError()
+    except ValueError:
+        raise argparse.ArgumentTypeError("Use an absolute HTTP(S) URL without credentials, whitespace or a fragment")
+    return value
+
+
+def notification_timeout(value):
+    value = bounded_int(value)
+    if value > 60:
+        raise argparse.ArgumentTypeError("Notification timeout must be between 1 and 60 seconds")
     return value
 
 
@@ -199,6 +228,12 @@ def log_event(line):
     return events, access
 
 
+def duration(seconds):
+    hours, remainder = divmod(int(max(0, seconds)), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 class Report:
     def __init__(self, out, args):
         self.out, self.args = Path(out), args
@@ -209,7 +244,16 @@ class Report:
         self.sites = collections.defaultdict(collections.Counter)
         self.preview = []
         self.started = time.time()
-        self.last_progress = 0
+        self.started_monotonic = time.monotonic()
+        self.last_progress = None
+        self.interactive = sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+        self.progress_visible = False
+        self.progress_phase = "Starting"
+        self.counting = False
+        self.total_items = None
+        self.completed_items = 0
+        self.scan_started = None
+        self.scan_complete = False
 
     def emit(self, stream, row):
         if stream not in self.handles:
@@ -239,22 +283,65 @@ class Report:
         if save and row["severity"] != "INFO" and len(self.preview) < 40:
             self.preview.append({k: row[k] for k in ("severity", "rule", "path")})
 
-    def progress(self, phase):
-        if time.time() - self.last_progress > 15:
-            print(f"[{utc(time.time())}] {phase} | Scan attempts so far: "
-                  f"{self.counts['files']:,} non-log files, {self.counts['logs']:,} log files | "
-                  f"Rule matches: {sum(self.severities.values()):,} "
-                  f"(HIGH={self.severities['HIGH']:,}, REVIEW={self.severities['REVIEW']:,}, "
-                  f"INFO={self.severities['INFO']:,}) | Matches are not confirmed infections", flush=True)
-            self.last_progress = time.time()
+    def progress(self, phase=None, force=False):
+        if phase is not None:
+            self.progress_phase = phase
+        now = time.monotonic()
+        interval = 0.25 if self.interactive else 15
+        if not force and self.last_progress is not None and now - self.last_progress < interval:
+            return
+        elapsed = duration(now - self.started_monotonic)
+        if self.counting:
+            message = f"Counting files: {self.total_items:,} found | Elapsed {elapsed}"
+        elif self.progress_phase == "Writing report" or self.scan_started is None:
+            message = f"{self.progress_phase} | Elapsed {elapsed}"
+        else:
+            if self.total_items is None:
+                status = f"{self.completed_items:,} finished | ETA unavailable"
+            else:
+                total = max(self.total_items, self.completed_items)
+                percent = 100 if self.scan_complete else min(99, int(100 * self.completed_items / max(1, total)))
+                filled = percent // 10
+                bar = "#" * filled + "-" * (10 - filled)
+                eta = "estimating"
+                if self.scan_complete:
+                    eta = "00:00:00"
+                elif self.completed_items and total > self.completed_items:
+                    remaining = (now - self.scan_started) * (total - self.completed_items) / self.completed_items
+                    eta = "~" + duration(max(1, remaining))
+                status = f"[{bar}] {percent:3d}% {self.completed_items:,}/{total:,} | ETA {eta}"
+            phase = {"Scanning files": "Files", "Scanning logs": "Logs", "Scan complete": "Scan complete"}.get(
+                self.progress_phase, self.progress_phase)
+            message = f"{status} | Elapsed {elapsed} | {phase}"
+        message += (f" | Matches={sum(self.severities.values()):,}"
+                    f" HIGH={self.severities['HIGH']:,} REVIEW={self.severities['REVIEW']:,}"
+                    f" INFO={self.severities['INFO']:,}")
+        if self.interactive:
+            # Stay below the last column so a long status cannot wrap into a list.
+            width = max(1, shutil.get_terminal_size((80, 24)).columns - 1)
+            print("\r\033[K" + message[:width], end="", flush=True)
+            self.progress_visible = True
+        else:
+            print(f"[{utc(time.time())}] {message}", flush=True)
+        self.last_progress = now
+
+    def clear_progress(self):
+        if self.progress_visible:
+            print("\r\033[K", end="", flush=True)
+            self.progress_visible = False
 
     def finish(self, complete):
+        self.progress("Writing report", force=True)
+        options = dict(vars(self.args))
+        for name in ("notify_url", "notify_token_file"):
+            if options.get(name):
+                options[name] = "[configured]"
         summary = {
             "scanner_version": VERSION, "hostname": socket.gethostname(),
             "started_utc": utc(self.started), "finished_utc": utc(time.time()),
             "scan_finished": complete, "counts": dict(self.counts),
             "indicators": dict(self.severities), "coverage_issues": dict(self.gaps),
-            "sites": dict(self.sites), "options": vars(self.args),
+            "sites": dict(self.sites), "options": options,
             "verdict": "REVIEW_REQUIRED" if self.severities["HIGH"] or self.severities["REVIEW"] else "NO_MATCHING_INDICATORS",
             "warning": "Not a clean bill of health. Indicators are heuristics, not proof. Review coverage and inventories.",
         }
@@ -294,41 +381,47 @@ class Report:
                 with path.open("rb") as handle:
                     for chunk in iter(lambda: handle.read(MIB), b""):
                         digest.update(chunk)
+                        self.progress()
                 manifest.write(digest.hexdigest() + "  " + path.name + "\n")
+        self.clear_progress()
         print("\n" + "\n".join(lines[:11]), flush=True)
 
 
-def walk_files(root, report):
+def walk_files(root, report, record=True):
     """Descriptor-relative traversal; never open a symlink, device, FIFO or socket."""
     visited = set()
+    gap = report.gap if record else lambda *args: None
 
     def descend(fd, path, depth):
         st = os.fstat(fd)
         identity = (st.st_dev, st.st_ino)
         if identity in visited or depth > 128:
-            report.gap(path, "directory_cycle_or_depth_limit")
+            gap(path, "directory_cycle_or_depth_limit")
             return
         visited.add(identity)
         try:
             # listdir(fd) works on Python 3.6; scandir(fd) was added in 3.7.
             for name in os.listdir(fd):
+                report.progress()
                 child = os.path.join(path, name)
                 if inside(child, str(report.out)):
                     continue  # Never ingest the report currently being written.
                 try:
                     st = os.stat(name, dir_fd=fd, follow_symlinks=False)
                     if stat.S_ISLNK(st.st_mode):
+                        if not record:
+                            continue
                         target = os.readlink(name, dir_fd=fd)
                         report.emit("symlinks", {"path": child, "target": target, "followed": False})
                         report.counts["symlinks_not_followed"] += 1
                         # Resolution is for reporting only, never used to open a file.
                         resolved = os.path.realpath(child)
                         if not inside(resolved, root):
-                            report.gap(child, "symlink_target_outside_root", target)
+                            gap(child, "symlink_target_outside_root", target)
                         elif not os.path.exists(child):
-                            report.gap(child, "broken_or_looping_symlink", target)
+                            gap(child, "broken_or_looping_symlink", target)
                     elif stat.S_ISDIR(st.st_mode):
-                        if report.site(child) == child:
+                        if record and report.site(child) == child:
                             report.sites[child]["directories"] += 1
                         cfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
                         try:
@@ -338,11 +431,11 @@ def walk_files(root, report):
                     elif stat.S_ISREG(st.st_mode):
                         yield child, st
                     else:
-                        report.gap(child, "non_regular_file_not_read", stat.filemode(st.st_mode))
+                        gap(child, "non_regular_file_not_read", stat.filemode(st.st_mode))
                 except OSError as exc:
-                    report.gap(child, "traversal_error", exc)
+                    gap(child, "traversal_error", exc)
         except OSError as exc:
-            report.gap(path, "directory_read_error", exc)
+            gap(path, "directory_read_error", exc)
 
     try:
         if inside(root, str(report.out)):
@@ -357,7 +450,7 @@ def walk_files(root, report):
         finally:
             os.close(fd)
     except OSError as exc:
-        report.gap(root, "root_unavailable", exc)
+        gap(root, "root_unavailable", exc)
 
 
 def read_prefix(path, limit, report):
@@ -582,7 +675,7 @@ def system_snapshot(report):
                      "--no-pager", "--output=short-iso", "-n", "20000"]),
     ]
     for name, argv in commands:
-        report.progress("Collecting " + name)
+        report.progress("Collecting " + name, force=True)
         snapshot(report, name, argv)
     report.gap("journal/logins", "bounded_system_snapshots", "Journal: last 20000 entries since --since; logins: last 200. Inspect older/off-host logs separately.")
     try:
@@ -608,30 +701,24 @@ def existing_paths(paths):
     return [path for path in paths if os.path.lexists(path)]
 
 
-def run_scan(report):
+def scan_targets(report, record=True):
+    """Use the same scope, classification and de-duplication for both passes."""
     args = report.args
-    system_snapshot(report)
     seen = set()
     roots = [args.home] + args.extra_root
     for root in roots:
-        for path, st in walk_files(root, report):
+        for path, st in walk_files(root, report, record=record):
             if path in seen:
                 continue
             seen.add(path)
-            if LOG_NAME.search(Path(path).name):
-                scan_log(path, report)
-            else:
-                scan_file(path, report)
+            yield path, st, "log" if LOG_NAME.search(Path(path).name) else "file"
     # Scan temp locations for dropped scripts/binaries without executing them.
     for root in existing_paths(["/tmp", "/var/tmp", "/dev/shm"]):
-        for path, st in walk_files(root, report):
+        for path, st in walk_files(root, report, record=record):
             if path in seen:
                 continue
             seen.add(path)
-            scan_file(path, report)
-            if st.st_mode & 0o111:
-                report.finding(path, {"severity": "REVIEW", "rule": "executable_in_temp",
-                                      "reason": "Executable file in a temporary directory; verify its owner and purpose."})
+            yield path, st, "temp"
     persistence = ["/etc/crontab", "/etc/cron.d", "/etc/cron.hourly", "/etc/cron.daily", "/etc/cron.weekly",
                    "/etc/cron.monthly", "/var/spool/cron", "/etc/systemd/system", "/etc/rc.local",
                    "/etc/ld.so.preload", "/etc/profile", "/etc/profile.d", "/etc/passwd", "/etc/group",
@@ -644,11 +731,11 @@ def run_scan(report):
         if re.fullmatch(r"php\d+rc", entry.name) and entry.is_dir(follow_symlinks=False):
             config.append(entry.path)
     for root, is_config in [(p, False) for p in existing_paths(persistence)] + [(p, True) for p in existing_paths(config)]:
-        for path, st in walk_files(root, report):
+        for path, st in walk_files(root, report, record=record):
             if path in seen:
                 continue
             seen.add(path)
-            scan_file(path, report, persistence=not is_config, config=is_config)
+            yield path, st, "config" if is_config else "persistence"
     log_roots = existing_paths(["/var/log", "/usr/local/lsws/logs"]) + args.log_root
     packages = "/RunCloud/Packages"
     if os.path.isdir(packages):
@@ -657,15 +744,53 @@ def run_scan(report):
                 log_roots += existing_paths([entry.path + "/var/log"])
                 conf = entry.path + "/etc"
                 if os.path.isdir(conf):
-                    for path, st in walk_files(conf, report):
+                    for path, st in walk_files(conf, report, record=record):
                         if path not in seen:
                             seen.add(path)
-                            scan_file(path, report, config=True)
+                            yield path, st, "config"
     for root in log_roots:
-        for path, st in walk_files(root, report):
+        for path, st in walk_files(root, report, record=record):
             if path not in seen and (LOG_NAME.search(Path(path).name) or root == path):
                 seen.add(path)
-                scan_log(path, report)
+                yield path, st, "log"
+
+
+def run_scan(report):
+    system_snapshot(report)
+    if not report.args.no_precount:
+        report.counting = True
+        report.total_items = 0
+        report.progress("Counting files", force=True)
+        try:
+            for _ in scan_targets(report, record=False):
+                report.total_items += 1
+                report.progress()
+        except OSError as exc:
+            # Counting is advisory; the real pass still records coverage failures.
+            report.gap("precount", "precount_incomplete", exc)
+            report.total_items = None
+        finally:
+            report.counting = False
+    report.scan_started = time.monotonic()
+    report.progress("Scanning files", force=True)
+    for path, st, kind in scan_targets(report):
+        if report.total_items is not None:
+            report.total_items = max(report.total_items, report.completed_items + 1)
+        phase = "Scanning logs" if kind == "log" else "Scanning files"
+        report.progress(phase)
+        if kind == "log":
+            scan_log(path, report)
+        else:
+            scan_file(path, report, persistence=kind == "persistence", config=kind == "config")
+            if kind == "temp" and st.st_mode & 0o111:
+                report.finding(path, {"severity": "REVIEW", "rule": "executable_in_temp",
+                                      "reason": "Executable file in a temporary directory; verify its owner and purpose."})
+        report.completed_items += 1
+        report.progress(phase)
+    report.scan_complete = True
+    if report.total_items is not None:
+        report.total_items = report.completed_items
+    report.progress("Scan complete", force=True)
 
 
 def parser():
@@ -677,18 +802,133 @@ def parser():
                    help="Recent-file/journal start; signatures and retained logs are NOT date-filtered. Default: 14 days ago")
     p.add_argument("--patched-at", type=parse_time, help="Optional UTC patch time; annotates mtime only, not compromise time")
     p.add_argument("--output-parent", default="/root", help="Existing root-owned private directory (default /root)")
-    p.add_argument("--max-file-mib", type=bounded_int, default=16, help="Leading bytes inspected per non-log file; default 16 MiB")
-    p.add_argument("--max-log-mib", type=bounded_int, default=512, help="Decompressed bytes inspected per log; default 512 MiB")
-    p.add_argument("--max-total-log-mib", type=bounded_int, default=8192, help="Total decompressed log budget; default 8192 MiB")
-    p.add_argument("--log-samples", type=bounded_int, default=200, help="Maximum saved indicator excerpts per log; counts continue")
+    p.add_argument("--no-precount", action="store_true", help="Start scanning sooner; omit file-count percentage and ETA")
+    p.add_argument("--quick", action="store_true", help="Use smaller read/sample limits for a faster first pass; reduces coverage")
+    p.add_argument("--notify-url", type=notification_url, help="POST a small JSON result summary to this HTTP(S) URL after the scan")
+    p.add_argument("--notify-token-file", help="Private root-owned file containing a bearer token for --notify-url")
+    p.add_argument("--notify-timeout", type=notification_timeout, default=10, help="Notification deadline in seconds (1-60; default 10)")
+    p.add_argument("--max-file-mib", type=bounded_int, help="Leading bytes per non-log file; default 16 MiB, or 1 with --quick")
+    p.add_argument("--max-log-mib", type=bounded_int, help="Decompressed bytes per log; default 512 MiB, or 32 with --quick")
+    p.add_argument("--max-total-log-mib", type=bounded_int, help="Total decompressed log budget; default 8192 MiB, or 512 with --quick")
+    p.add_argument("--log-samples", type=bounded_int, help="Saved excerpts per log; default 200, or 50 with --quick; counting continues")
     return p
 
 
+def parse_options(argv=None):
+    argument_parser = parser()
+    args = argument_parser.parse_args(argv)
+    if args.notify_token_file and not args.notify_url:
+        argument_parser.error("--notify-token-file requires --notify-url")
+    limits = {"max_file_mib": (16, 1), "max_log_mib": (512, 32),
+              "max_total_log_mib": (8192, 512), "log_samples": (200, 50)}
+    for name, values in limits.items():
+        if getattr(args, name) is None:
+            setattr(args, name, values[1 if args.quick else 0])
+    return args
+
+
+def read_notification_token(path):
+    if not path:
+        return None
+    handle, _ = open_regular(os.path.abspath(path))
+    with handle:
+        info = os.fstat(handle.fileno())
+        if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError("Notification token file must be root-owned and private (mode 0600 or 0400)")
+        data = handle.read(4097)
+    if len(data) > 4096:
+        raise ValueError("Notification token file exceeds 4096 bytes")
+    token = data.decode("ascii").strip()
+    if not token or any(ord(char) < 33 or ord(char) > 126 for char in token):
+        raise ValueError("Notification token must contain one nonempty ASCII token without whitespace")
+    return token
+
+
+def notification_payload(args, report, started, elapsed, complete, finalized, exit_code):
+    counts = report.counts if report is not None else collections.Counter()
+    severities = report.severities if report is not None else collections.Counter()
+    return {
+        "schema_version": 1, "event": "runcloud-triage.finished", "scanner_version": VERSION,
+        "run_id": report.out.name if report is not None else None,
+        "hostname": socket.gethostname(), "started_utc": utc(started), "finished_utc": utc(time.time()),
+        "duration_seconds": round(max(0, elapsed), 2),
+        "status": {0: "completed", 1: "review_required", 2: "incomplete"}[exit_code],
+        "exit_code": exit_code, "scan_finished": complete, "report_finalized": finalized,
+        "verdict": "REVIEW_REQUIRED" if severities["HIGH"] or severities["REVIEW"] else "NO_MATCHING_INDICATORS",
+        "counts": {name: counts[name] for name in ("files", "logs")},
+        "indicators": {name: severities[name] for name in ("HIGH", "REVIEW", "INFO")},
+        "coverage_issues": dict(report.gaps) if report is not None else {},
+        "quick_mode": args.quick,
+        "limits": {name: getattr(args, name) for name in ("max_file_mib", "max_log_mib", "max_total_log_mib", "log_samples")},
+    }
+
+
+class NoNotificationRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None
+
+
+@contextmanager
+def notification_deadline(seconds):
+    # Linux CLI runs on the main thread. Bound DNS/header waits as well as sockets.
+    if not hasattr(signal, "setitimer"):
+        yield
+        return
+    def expired(signum, frame):
+        raise TimeoutError("Notification deadline exceeded")
+    started = time.monotonic()
+    previous_handler = signal.signal(signal.SIGALRM, expired)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0]:
+            signal.setitimer(signal.ITIMER_REAL, max(0.001, previous_timer[0] - (time.monotonic() - started)), previous_timer[1])
+
+
+def send_notification(args, payload, token=None):
+    headers = {"Content-Type": "application/json; charset=utf-8", "User-Agent": "runcloud-triage/" + VERSION}
+    if token is not None:
+        headers["Authorization"] = "Bearer " + token
+    print("Sending completion notification...", flush=True)
+    try:
+        with notification_deadline(args.notify_timeout):
+            request = urllib.request.Request(args.notify_url, data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
+                                             headers=headers, method="POST")
+            # Send only to the selected endpoint; do not inherit proxy destinations.
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoNotificationRedirects())
+            with opener.open(request, timeout=args.notify_timeout) as response:
+                code = response.getcode()
+                # Never download, display or execute the response body.
+                if not 200 <= code < 300:
+                    raise ValueError("Non-success response")
+        print(f"Notification delivered (HTTP {code}).", flush=True)
+        return True
+    except urllib.error.HTTPError as exc:
+        detail = "HTTP " + str(exc.code)
+        exc.close()
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        # URLs, headers and response/error bodies can contain secrets.
+        detail = type(exc).__name__
+    except KeyboardInterrupt:
+        detail = "cancelled"
+    print("Notification delivery failed (" + detail + "). Scan exit code and local report are unchanged.", file=sys.stderr)
+    return False
+
+
 def main():
-    args = parser().parse_args()
+    args = parse_options()
     if not sys.platform.startswith("linux") or os.geteuid() != 0:
         print("Run this on the Ubuntu server as root using /usr/bin/python3 -I.", file=sys.stderr)
         return 2
+    try:
+        notify_token = read_notification_token(args.notify_token_file)
+    except (OSError, ValueError):
+        print("Cannot read notification token: use a private, root-owned regular file with one ASCII token (up to 4096 bytes), without symlinks.", file=sys.stderr)
+        return 2
+    started, started_monotonic = time.time(), time.monotonic()
     os.umask(0o077)
     for name in ("home", "output_parent"):
         setattr(args, name, os.path.abspath(getattr(args, name)))
@@ -697,6 +937,8 @@ def main():
     args.since = args.since.isoformat()
     args.patched_at = args.patched_at.isoformat() if args.patched_at else None
     out = None
+    report = None
+    complete, finalized, exit_code = False, False, 2
     try:
         dfd = open_directory(args.output_parent)
         try:
@@ -720,11 +962,13 @@ def main():
         except OSError as exc:
             report.gap(__file__, "scanner_hash_unavailable", exc)
         print("Writing private report to: " + out, flush=True)
+        print("Progress measures scan attempts. HIGH/REVIEW need investigation; INFO provides context. Matches are not confirmed infections.", flush=True)
+        if args.quick:
+            print("Quick mode: reduced read limits; check coverage.jsonl for content not inspected.", flush=True)
         try:
             os.nice(10)
         except OSError:
             pass
-        complete = False
         try:
             run_scan(report)
             complete = True
@@ -733,12 +977,21 @@ def main():
         except Exception as exc:
             report.gap("scan", "unexpected_error", f"{type(exc).__name__}: {exc}")
         report.finish(complete)
-        if not complete or any(key in report.gaps for key in ("root_unavailable", "directory_read_error", "traversal_error", "file_read_error", "log_read_error")):
-            return 2
-        return 1 if report.severities["HIGH"] or report.severities["REVIEW"] else 0
+        finalized = True
+        if complete and not any(key in report.gaps for key in ("root_unavailable", "directory_read_error", "traversal_error", "file_read_error", "log_read_error")):
+            exit_code = 1 if report.severities["HIGH"] or report.severities["REVIEW"] else 0
     except (OSError, ValueError) as exc:
+        if report is not None:
+            report.clear_progress()
         print(f"Cannot finish triage: {exc}. Partial report: {out}", file=sys.stderr)
-        return 2
+    except KeyboardInterrupt:
+        if report is not None:
+            report.clear_progress()
+        print("Triage interrupted before report finalization.", file=sys.stderr)
+    if args.notify_url:
+        payload = notification_payload(args, report, started, time.monotonic() - started_monotonic, complete, finalized, exit_code)
+        send_notification(args, payload, notify_token)
+    return exit_code
 
 
 if __name__ == "__main__":

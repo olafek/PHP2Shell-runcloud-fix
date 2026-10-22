@@ -2,7 +2,7 @@
 
 A standalone, read-only triage script for **RunCloud on Ubuntu 18.04 and newer**, including servers running **PHP 7.4 and newer**. It runs as root, inspects sites throughout `/home`, and writes a private report for each server.
 
-**It requires Python 3.6 or newer. It does not require, execute, upgrade, or modify PHP.** It uses only Python's standard library and does not install Python packages, contact websites, or upload results.
+**It requires Python 3.6 or newer. It does not require, execute, upgrade, or modify PHP.** It uses only Python's standard library and does not install Python packages. By default it makes no network requests or uploads. Optional `--notify-url` sends a small JSON result summary to an endpoint you choose.
 
 This is a first-pass investigation tool for the PHP vulnerabilities announced on 21 October 2026 and for common signs of persistent compromise. **It cannot certify that a server is clean, identify every attack, or prove that a finding was caused by PHP2Shell.** A successful attack may leave no files or retained logs. File timestamps alone cannot establish whether compromise happened before patching.
 
@@ -95,28 +95,123 @@ The patch time above is an **example**, not an assumed time for your servers. Om
 - **All discovered retained logs are considered regardless of date**, up to the reported byte limits. This includes evidence predating the recent-file window.
 - `--patched-at` labels a file's modification time as before/after the supplied time. It does not determine when an attacker gained access; `ctime` is inode-change time, not creation time.
 
-The terminal prints the exact report directory and progress about every 15 seconds while it is doing file/log work. Large servers can take a long time: it reads files across `/home`, including media, dependencies and old releases. Keep the SSH session open or use an existing `tmux`/`screen` session. Ctrl+C attempts to save a clearly marked partial report; a killed process or full disk may prevent finalization.
+The terminal prints the exact report directory, collects system snapshots, then counts files before scanning their contents. In an interactive SSH terminal, one progress bar updates in place as work advances, up to four times per second. Redirected/piped output uses plain lines about every 15 seconds and at phase changes. Large servers can take a long time: the scanner reads files across `/home`, including media, dependencies and old releases. Keep the SSH session open or use an existing `tmux`/`screen` session. Ctrl+C attempts to save a clearly marked partial report; a killed process or full disk may prevent finalization.
 
-### Reading the progress line
+### Reading the progress bar
 
-Older versions display a line such as `Scanning files: 12456 files, 40 logs, 123 indicators`. These are cumulative totals for the current run, not a count of infected files:
+The initial `Counting files` phase walks directory metadata without reading file contents. It counts the same eligible files and logs the scan will visit, without following symlinks or including its own report directory. This adds a directory walk; use `--no-precount` below to skip it.
 
-- **Scanning files:** the scanner's current activity. It can switch between file and log inspection as it walks the server.
-- **12,456 files:** non-log file scan attempts so far, including application code, dependencies, uploads, configuration, and other files in scope.
-- **40 logs:** log files attempted, including rotated/compressed logs; this is not the number of log entries. The currently open log is included.
-- **123 indicators:** rule matches counted so far across all severities. One file can match several rules, and repeated log messages can contribute many matches. The total includes informational events and does not mean 123 infections or attacks.
-
-Updated versions make these labels explicit and show the severity breakdown. For example, an illustrative split of those 123 matches is:
+Once counting finishes, a wide terminal might show:
 
 ```text
-[2026-10-22T12:00:00+00:00] Scanning files | Scan attempts so far: 12,456 non-log files, 40 log files | Rule matches: 123 (HIGH=3, REVIEW=20, INFO=100) | Matches are not confirmed infections
+[###-------]  31% 12,496/40,000 | ETA ~00:20:58 | Elapsed 00:09:32 | Files | Matches=123 HIGH=3 REVIEW=20 INFO=100
 ```
 
-**HIGH** means prioritise source review; **REVIEW** means investigate the context; **INFO** supplies context, such as ordinary PHP fatal errors or successful SSH logins. Even HIGH matches can come from legitimate code or test fixtures. The old progress line does not reveal how its total is split.
+- **31%, 12,496/40,000:** finished scan attempts out of the counted total, combining non-log files and log files. Each log file counts as one item, regardless of how many entries it contains. The current item is counted as finished only when its attempt ends.
+- **ETA:** approximate time remaining for file/log scanning, based on average time per finished item. It shows `estimating` until an estimate is available. File sizes, compressed logs, and disk load vary, so the estimate can increase. It excludes report finalization.
+- **Elapsed:** time since this run started, including system snapshots and counting.
+- **Files / Logs:** the current activity. A large log can keep the same percentage while elapsed time and match counts advance. A narrow terminal trims trailing details to prevent wrapping.
+- **Matches / HIGH / REVIEW / INFO:** rule-match totals and their severity breakdown, not infected-file counts. One file can trigger several rules, and repeated log messages contribute multiple matches.
 
-File/log counts include failed or partial attempts and logs skipped after the total log byte budget is reached. Check `coverage.jsonl` for those gaps. Totals can increase while the same log is open, and the scanner does not calculate a percentage complete or time remaining. Indicator counts also continue after the per-log evidence sample limit, so they can exceed the number of entries saved in `findings.jsonl`.
+**HIGH** means prioritise source review; **REVIEW** means investigate the context; **INFO** supplies context, such as ordinary PHP fatal errors or successful SSH logins. Even HIGH matches can come from legitimate code or test fixtures. `123` matches does not mean 123 infections or attacks.
 
-Let the scan finish, then read `summary.txt` for completion and severity totals, `findings.jsonl` for saved matches and their paths, and `coverage.jsonl` for gaps, where present. A scan already running keeps its original progress format; there is no need to interrupt it for this display change.
+Files can appear or disappear between the two passes. The total adjusts as needed, and `100%` appears only when file/log scanning ends; `Writing report` follows. Finished attempts include read failures, partial reads, and logs skipped after the total log byte budget is reached. **100% is not a guarantee of complete coverage**: check `coverage.jsonl`. Indicator counts continue after the per-log evidence sample limit, so they can exceed the number of entries saved in `findings.jsonl`.
+
+Older versions display `Scanning files: 12456 files, 40 logs, 123 indicators` instead: those are cumulative scan attempts and rule matches, with no percentage or ETA. A scan already running keeps its original display. Let it finish, then read `summary.txt`, `findings.jsonl`, and `coverage.jsonl`, where present.
+
+### Speed options
+
+The default scan keeps the original read limits and includes counting for the progress bar. Choose an alternative when needed:
+
+**Faster startup with the same scan scope and read limits:** skip the counting pass. The status line still updates in place and shows finished attempts, elapsed time, and matches, but no percentage or ETA.
+
+```bash
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --no-precount
+```
+
+**Quick first pass with a progress bar:** use smaller read limits. It still visits the same file paths, but may miss indicators beyond the inspected prefixes or log budget. Review the reported coverage gaps; use the default or larger limits for a fuller investigation.
+
+```bash
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --quick
+```
+
+| Limit | Default | `--quick` |
+| --- | --- | --- |
+| Leading content per non-log file | 16 MiB | 1 MiB |
+| Decompressed content per log file | 512 MiB | 32 MiB |
+| Total decompressed log content | 8 GiB | 512 MiB |
+| Saved evidence excerpts per log | 200 | 50 |
+
+**Combine both speed options:** use the quick limits and skip counting.
+
+```bash
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --quick --no-precount
+```
+
+Explicit limits override the quick defaults regardless of argument order. For example, keep the quick preset but allow up to 128 MiB per log:
+
+```bash
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --quick --max-log-mib 128
+```
+
+You can also set `--max-file-mib`, `--max-log-mib`, `--max-total-log-mib`, and `--log-samples` individually. Reducing `--log-samples` saves report output; it does not stop match counting within the inspected content. Quick mode helps most when large files/logs dominate; it still traverses all configured paths, so there is no fixed runtime guarantee. `ionice -c3`, shown above, reduces disk priority to limit server impact and can make a scan slower.
+
+### Optional completion callback
+
+Use `--notify-url` to notify your own project when a run ends. This is an **HTTP POST with JSON**, not an ICMP ping or a GET request. It is disabled unless you supply a URL.
+
+```bash
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --notify-url 'https://your-project.example/api/triage-results'
+```
+
+The callback contains the hostname, run ID, timing, scan outcome, file/log counts, severity totals, coverage-gap counts, and effective read limits. It does not send application file paths, log excerpts, findings, credentials, or report attachments. Use HTTPS for remote endpoints; HTTP is available for local/private testing.
+
+For an authenticated endpoint, create a root-owned, mode `0600` or `0400` regular file containing one bearer token, for example `/root/runcloud-triage-notify.token`. Keep it outside scanned directories. Symlinks, empty tokens, internal whitespace, and files larger than 4096 bytes are rejected. A trailing newline is accepted.
+
+```bash
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --notify-url 'https://your-project.example/api/triage-results' --notify-token-file /root/runcloud-triage-notify.token --notify-timeout 15
+```
+
+This adds `Authorization: Bearer TOKEN` to the request. Avoid credentials in URLs: command-line URLs can appear in process listings and local snapshots. Callback options are redacted in `summary.jsonl`; token contents are never stored there. Notification flags can be combined with `--quick`, `--no-precount`, or custom scan limits.
+
+An example payload for a completed scan with indicators to review:
+
+```json
+{
+  "schema_version": 1,
+  "event": "runcloud-triage.finished",
+  "scanner_version": "1.2.0",
+  "run_id": "runcloud-triage-web-01-20261022T120000Z-a1b2c3d4",
+  "hostname": "web-01",
+  "started_utc": "2026-10-22T12:00:00+00:00",
+  "finished_utc": "2026-10-22T12:10:00+00:00",
+  "duration_seconds": 600.0,
+  "status": "review_required",
+  "exit_code": 1,
+  "scan_finished": true,
+  "report_finalized": true,
+  "verdict": "REVIEW_REQUIRED",
+  "counts": {"files": 12456, "logs": 40},
+  "indicators": {"HIGH": 3, "REVIEW": 20, "INFO": 100},
+  "coverage_issues": {"file_content_limit": 7, "log_content_limit": 2},
+  "quick_mode": false,
+  "limits": {"max_file_mib": 16, "max_log_mib": 512, "max_total_log_mib": 8192, "log_samples": 200}
+}
+```
+
+In your project, accept a POST with `Content-Type: application/json; charset=utf-8`, validate the bearer token if configured, store the result, and return a **2xx** response promptly. `hostname` and `run_id` identify the server and local report folder. The response body is ignored.
+
+| `status` | Meaning / suggested action |
+| --- | --- |
+| `completed` | Exit 0: no HIGH/REVIEW indicators or hard read failures. Review coverage gaps; this is not a clean bill of health. |
+| `review_required` | Exit 1: at least one HIGH/REVIEW indicator. Queue an alert for investigation. |
+| `incomplete` | Exit 2: interrupted run, initialization/finalization failure, or hard read/traversal failure. Alert that the scan needs attention. |
+
+Check `status`, `scan_finished`, and `report_finalized` together. For example, traversal can finish with read failures (`scan_finished: true`, `status: incomplete`). An initialization failure may have `run_id: null` and no report. A `NO_MATCHING_INDICATORS` verdict on an incomplete run does not establish safety.
+
+The scanner makes **one delivery attempt**, normally after report finalization, including runs with no indicators. It also attempts a failure callback for initialization/finalization errors or a handled Ctrl+C. Invalid arguments, an unreadable token file, failure of the Linux/root prerequisite, a forced kill, or a server outage can prevent any callback.
+
+`--notify-timeout` sets a 1–60 second delivery deadline (default **10 seconds**) on Linux. Redirects are refused, environment proxy settings are ignored, and HTTPS certificate verification remains enabled. A delivery failure prints a separate message without changing the scan's exit code or local report. There are no automatic retries; a lost response can mean the receiver accepted a request even though delivery is reported as failed. Treat this as a best-effort completion notification, not a guaranteed heartbeat.
 
 ## 5. Understand the report
 
@@ -257,7 +352,7 @@ python3 -m py_compile runcloud-triage.py
 
 Linux filesystem fixtures test symlink/FIFO handling, age-independent coverage, report generation, compressed logs, limits and read failures. Detection and timestamp tests can also run on Windows; Linux-specific tests are skipped there. Python 3.6 grammar is checked on interpreters that provide AST grammar selection. Testing on a newer interpreter does not substitute for an end-to-end trial on your oldest server image.
 
-Validation for this version: **25 tests passed on Linux with Python 3.10.12**, including an isolated full command-line run exercising exit codes 0/1/2 and report permissions, output and timeout limits, and progress totals for repeated matches whose evidence is not saved. Python 3.6 syntax and the APIs used for older-Ubuntu compatibility were checked; an actual Ubuntu 18.04/Python 3.6 runtime was not available for execution here.
+Validation for this version: **45 tests passed on Linux with Python 3.10.12**, including isolated command-line runs exercising exit codes 0/1/2, report permissions, quick mode, and callbacks for completed/partial/interrupted runs; counting and ETA; and notification authentication, redirects, deadlines, payload filtering, and failure handling. Notification transport tests use a local HTTP receiver and do not contact external services. Python 3.6 syntax and the APIs used for older-Ubuntu compatibility were checked; an actual Ubuntu 18.04/Python 3.6 runtime was not available for execution here.
 
 ### Publishing updates
 

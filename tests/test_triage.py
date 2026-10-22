@@ -4,7 +4,9 @@ import ast
 import bz2
 import gzip
 import hashlib
+import http.server
 import importlib.util
+import io
 import json
 import lzma
 import os
@@ -13,6 +15,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -81,9 +85,14 @@ class DetectionTests(unittest.TestCase):
 
 
 class ProgressTests(unittest.TestCase):
+    def report(self):
+        report = triage.Report("unused", triage.parse_options([]))
+        report.interactive = False
+        report.started_monotonic = report.scan_started = 0
+        return report
+
     def test_progress_includes_repeated_unsaved_matches_and_severity(self):
-        report = triage.Report("unused", argparse.Namespace(home="/home"))
-        report.counts.update(files=12456, logs=40)
+        report = self.report()
         # Two lines in the same log each match both REVIEW and INFO rules.
         # Unsaved evidence still contributes to the live totals.
         events, _ = triage.log_event(b"PHP Fatal error: Allowed memory size of 1 byte exhausted\n")
@@ -93,11 +102,193 @@ class ProgressTests(unittest.TestCase):
         with mock.patch("builtins.print") as output:
             report.progress("Scanning logs")
         message = output.call_args[0][0]
-        self.assertIn("12,456 non-log files, 40 log files", message)
-        self.assertIn("Rule matches: 4", message)
-        self.assertIn("HIGH=0, REVIEW=2, INFO=2", message)
-        self.assertIn("not confirmed infections", message)
+        self.assertIn("Matches=4", message)
+        self.assertIn("HIGH=0 REVIEW=2 INFO=2", message)
         self.assertFalse(report.handles)
+
+    def test_percentage_eta_and_completion(self):
+        report = self.report()
+        report.total_items, report.completed_items = 4, 1
+        with mock.patch.object(triage.time, "monotonic", return_value=30), mock.patch("builtins.print") as output:
+            report.progress("Scanning logs")
+            self.assertIn("25% 1/4 | ETA ~00:01:30 | Elapsed 00:00:30 | Logs", output.call_args[0][0])
+            # Discovery has not ended yet: reaching the old count is not completion.
+            report.completed_items = 4
+            report.progress(force=True)
+            self.assertNotIn("100%", output.call_args[0][0])
+            report.scan_complete = True
+            report.progress("Scan complete", force=True)
+            self.assertIn("100% 4/4 | ETA 00:00:00", output.call_args[0][0])
+
+    def test_empty_and_unknown_totals(self):
+        report = self.report()
+        with mock.patch("builtins.print") as output:
+            report.progress("Scanning files")
+            self.assertIn("ETA unavailable", output.call_args[0][0])
+            report.total_items = 0
+            report.progress(force=True)
+            self.assertIn("0% 0/0 | ETA estimating", output.call_args[0][0])
+            report.scan_complete = True
+            report.progress(force=True)
+            self.assertIn("100% 0/0", output.call_args[0][0])
+
+    def test_redirected_output_is_plain_and_rate_limited(self):
+        output = io.StringIO()
+        with mock.patch.object(triage.sys, "stdout", output):
+            report = triage.Report("unused", triage.parse_options([]))
+            with mock.patch.object(triage.time, "monotonic", side_effect=[100, 101, 115]):
+                report.progress("Collecting processes")
+                report.progress()
+                report.progress()
+        self.assertFalse(report.interactive)
+        self.assertEqual(len(output.getvalue().splitlines()), 2)
+        self.assertNotIn("\r", output.getvalue())
+        self.assertNotIn("\033", output.getvalue())
+
+    def test_terminal_updates_one_line_and_respects_width(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+        output = Terminal()
+        with mock.patch.object(triage.sys, "stdout", output), mock.patch.dict(os.environ, TERM="xterm"), \
+                mock.patch.object(triage.shutil, "get_terminal_size", return_value=os.terminal_size((60, 24))):
+            report = triage.Report("unused", triage.parse_options([]))
+            report.counting, report.total_items = True, 12345
+            report.progress(force=True)
+            report.counting, report.scan_started = False, triage.time.monotonic()
+            report.progress("Scanning files", force=True)
+            report.clear_progress()
+        self.assertTrue(report.interactive)
+        self.assertEqual(output.getvalue().count("\r\033[K"), 3)
+        self.assertNotIn("\n", output.getvalue())
+        self.assertTrue(all(len(line) <= 59 for line in output.getvalue().split("\r\033[K")))
+
+
+class OptionTests(unittest.TestCase):
+    def test_standard_and_quick_limits(self):
+        for options, expected in (([], (16, 512, 8192, 200)), (["--quick"], (1, 32, 512, 50))):
+            args = triage.parse_options(options)
+            self.assertEqual((args.max_file_mib, args.max_log_mib, args.max_total_log_mib, args.log_samples), expected)
+            self.assertFalse(args.no_precount)
+
+    def test_explicit_limits_override_quick_in_either_order(self):
+        limits = ["--max-file-mib=8", "--max-log-mib", "64", "--max-total-log-mib", "1024", "--log-samples", "75"]
+        for options in (["--quick"] + limits, limits + ["--quick"]):
+            args = triage.parse_options(options + ["--no-precount"])
+            self.assertEqual((args.max_file_mib, args.max_log_mib, args.max_total_log_mib, args.log_samples), (8, 64, 1024, 75))
+            self.assertTrue(args.no_precount)
+
+    def test_notification_options_validate_before_scanning(self):
+        self.assertIsNone(triage.parse_options([]).notify_url)
+        self.assertEqual(triage.parse_options(["--notify-url", "https://example.test/hook"]).notify_timeout, 10)
+        for options in (["--notify-url", "file:///etc/passwd"], ["--notify-url", "https://user:pass@example.test/hook"],
+                        ["--notify-url", "https://example.test/hook#fragment"], ["--notify-url", "http://example.test:99999"],
+                        ["--notify-url", "https://example.test/\r\nheader"], ["--notify-token-file", "/root/token"],
+                        ["--notify-timeout", "0"], ["--notify-timeout", "61"]):
+            with mock.patch.object(triage.sys, "stderr", io.StringIO()), self.assertRaises(SystemExit):
+                triage.parse_options(options)
+
+
+class NotificationTests(unittest.TestCase):
+    def setUp(self):
+        self.requests = []
+        fixture = self
+        self.response_status = 204
+        self.response_delay = 0
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                fixture.requests.append((self.path, dict(self.headers), json.loads(body.decode("utf-8"))))
+                time.sleep(fixture.response_delay)
+                self.send_response(fixture.response_status)
+                self.send_header("Content-Length", "0")
+                if 300 <= fixture.response_status < 400:
+                    self.send_header("Location", "/redirected?secret=must-not-follow")
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01})
+        self.thread.daemon = True
+        self.thread.start()
+        self.args = triage.parse_options(["--notify-url", "http://127.0.0.1:{}/hook?key=private-url".format(self.server.server_port)])
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def test_posts_json_with_optional_auth_and_ignores_proxy_environment(self):
+        # Only the local fixture is contacted, even with proxy variables present.
+        with mock.patch.dict(os.environ, {"http_proxy": "http://127.0.0.1:1", "HTTP_PROXY": "http://127.0.0.1:1"}), \
+                mock.patch("builtins.print"):
+            self.assertTrue(triage.send_notification(self.args, {"schema_version": 1, "exit_code": 1}, "private-token"))
+        path, headers, payload = self.requests[0]
+        self.assertEqual(path, "/hook?key=private-url")
+        self.assertEqual(headers["Authorization"], "Bearer private-token")
+        self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")
+        self.assertEqual(payload, {"schema_version": 1, "exit_code": 1})
+
+    def test_redirects_are_not_followed(self):
+        for code in (301, 302, 303, 307, 308):
+            self.requests.clear()
+            self.response_status = code
+            with mock.patch("builtins.print"):
+                self.assertFalse(triage.send_notification(self.args, {"exit_code": 0}, "private-token"))
+            self.assertEqual(len(self.requests), 1)
+            self.assertTrue(self.requests[0][0].startswith("/hook"))
+
+    def test_failure_is_not_retried_and_does_not_print_secrets(self):
+        self.response_status = 503
+        with mock.patch("builtins.print") as output:
+            self.assertFalse(triage.send_notification(self.args, {"exit_code": 1}, "private-token"))
+        message = output.call_args[0][0]
+        self.assertIn("HTTP 503", message)
+        self.assertNotIn("private-url", message)
+        self.assertNotIn("private-token", message)
+        self.assertEqual(len(self.requests), 1)
+
+    def test_notification_timeout(self):
+        self.response_delay = 2
+        self.args.notify_timeout = 1
+        started = time.monotonic()
+        with mock.patch("builtins.print"):
+            self.assertFalse(triage.send_notification(self.args, {"exit_code": 0}))
+        self.assertLess(time.monotonic() - started, 1.8)
+
+    @unittest.skipUnless(hasattr(triage.signal, "setitimer"), "Total deadline requires Unix interval timers")
+    def test_total_deadline_bounds_blocking_setup_and_restores_alarm(self):
+        self.args.notify_timeout = 1
+        previous_handler = triage.signal.getsignal(triage.signal.SIGALRM)
+        with mock.patch.object(triage.urllib.request, "build_opener") as opener, mock.patch("builtins.print"):
+            opener.return_value.open.side_effect = lambda *args, **kwargs: time.sleep(2)
+            started = time.monotonic()
+            self.assertFalse(triage.send_notification(self.args, {"exit_code": 0}))
+        self.assertLess(time.monotonic() - started, 1.8)
+        self.assertEqual(triage.signal.getsignal(triage.signal.SIGALRM), previous_handler)
+        self.assertEqual(triage.signal.getitimer(triage.signal.ITIMER_REAL)[0], 0)
+
+    def test_payload_is_a_summary_without_paths_options_or_evidence(self):
+        report = triage.Report("/root/report-id", self.args)
+        report.counts.update(files=123, logs=4)
+        report.severities.update(HIGH=2, REVIEW=3, INFO=4)
+        report.gaps["file_read_error"] = 1
+        report.preview.append({"path": "/private/site.php", "excerpt": "secret-evidence"})
+        report.sites["/private/site"]["HIGH"] = 2
+        for code, expected in ((0, "completed"), (1, "review_required"), (2, "incomplete")):
+            payload = triage.notification_payload(self.args, report, 0, 20, code != 2, True, code)
+            self.assertEqual(payload["status"], expected)
+            self.assertEqual(payload["counts"], {"files": 123, "logs": 4})
+            self.assertEqual(payload["indicators"], {"HIGH": 2, "REVIEW": 3, "INFO": 4})
+            self.assertEqual(payload["coverage_issues"], {"file_read_error": 1})
+            self.assertEqual(payload["run_id"], "report-id")
+            serialized = json.dumps(payload)
+            for sensitive in ("private-url", "secret-evidence", "/private", "/root"):
+                self.assertNotIn(sensitive, serialized)
+        missing = triage.notification_payload(self.args, None, 0, 1, False, False, 2)
+        self.assertIsNone(missing["run_id"])
+        self.assertFalse(missing["report_finalized"])
+        self.assertEqual(missing["status"], "incomplete")
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "Filesystem tests require Linux")
@@ -109,7 +300,7 @@ class LinuxFixtureTests(unittest.TestCase):
         self.home.mkdir()
         self.out = self.root / "report"
         self.out.mkdir(mode=0o700)
-        self.args = triage.parser().parse_args([])
+        self.args = triage.parse_options([])
         self.args.home = str(self.home)
         self.args.since = "2026-10-01T00:00:00+00:00"
         self.args.patched_at = "2026-10-21T15:00:00+00:00"
@@ -173,6 +364,80 @@ class LinuxFixtureTests(unittest.TestCase):
     def test_does_not_scan_own_output(self):
         (self.out / "existing.txt").write_text("private report")
         self.assertEqual(list(triage.walk_files(str(self.out), self.report)), [])
+
+    def test_counting_uses_same_targets_without_reading_content_or_duplicating_records(self):
+        self.write("alice/webapps/site/code.php", request_sample())
+        self.write("alice/webapps/site/error.log", b"ordinary log\n")
+        (self.home / "link").symlink_to(self.out, target_is_directory=True)
+        os.mkfifo(str(self.home / "pipe"))
+        self.args.extra_root = [str(self.home), str(self.home / "alice")]
+        self.args.log_root = [str(self.home / "alice/webapps/site/error.log")]
+        # Restrict discovery to the fixture. No real host directories are scanned.
+        with mock.patch.object(triage, "existing_paths", return_value=[]), \
+                mock.patch.object(triage.os, "scandir", return_value=[]), \
+                mock.patch.object(triage.os.path, "isdir", return_value=False):
+            with mock.patch.object(triage, "open_regular", side_effect=AssertionError("Counting must not read contents")):
+                counted = list(triage.scan_targets(self.report, record=False))
+            self.assertFalse(self.report.handles)
+            self.assertFalse(self.report.counts)
+            self.assertFalse(self.report.gaps)
+            self.assertFalse(self.report.sites)
+            scanned = list(triage.scan_targets(self.report))
+        self.assertEqual([(p, kind) for p, _, kind in counted], [(p, kind) for p, _, kind in scanned])
+        self.assertEqual(len(counted), 2)
+        self.assertEqual({kind for _, _, kind in counted}, {"file", "log"})
+        self.assertEqual(len(self.rows("symlinks")), 2)  # Two overlapping root walks, not doubled by counting.
+
+    def test_progress_accounts_for_new_files_and_failed_attempts(self):
+        path = self.write("normal.txt", b"normal")
+        target = (str(path), path.stat(), "file")
+        missing = (str(self.home / "removed.txt"), path.stat(), "file")
+        with mock.patch.object(triage, "system_snapshot"), \
+                mock.patch.object(triage, "scan_targets", side_effect=[iter([target]), iter([target, missing])]):
+            triage.run_scan(self.report)
+        self.assertEqual(self.report.completed_items, 2)
+        self.assertEqual(self.report.total_items, 2)
+        self.assertEqual(self.report.gaps["file_read_error"], 1)
+        self.assertTrue(self.report.scan_complete)
+
+    def test_no_precount_uses_one_pass(self):
+        self.args.no_precount = True
+        path = self.write("normal.txt", b"normal")
+        with mock.patch.object(triage, "system_snapshot"), \
+                mock.patch.object(triage, "scan_targets", return_value=iter([(str(path), path.stat(), "file")])) as targets:
+            triage.run_scan(self.report)
+        targets.assert_called_once_with(self.report)
+        self.assertIsNone(self.report.total_items)
+        self.assertEqual(self.report.completed_items, 1)
+
+    def test_disappearing_files_adjust_total_at_finish(self):
+        path = self.write("normal.txt", b"normal")
+        target = (str(path), path.stat(), "file")
+        with mock.patch.object(triage, "system_snapshot"), \
+                mock.patch.object(triage, "scan_targets", side_effect=[iter([target] * 3), iter([target])]):
+            triage.run_scan(self.report)
+        self.assertEqual(self.report.total_items, 1)
+        self.assertEqual(self.report.completed_items, 1)
+        self.assertTrue(self.report.scan_complete)
+
+    def test_failed_counting_falls_back_to_scan_without_eta(self):
+        with mock.patch.object(triage, "system_snapshot"), \
+                mock.patch.object(triage, "scan_targets", side_effect=[PermissionError("fixture"), iter([])]):
+            triage.run_scan(self.report)
+        self.assertIsNone(self.report.total_items)
+        self.assertEqual(self.report.gaps["precount_incomplete"], 1)
+        self.assertTrue(self.report.scan_complete)
+
+    def test_interrupt_during_counting_leaves_partial_report(self):
+        with mock.patch.object(triage, "system_snapshot"), \
+                mock.patch.object(triage, "scan_targets", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                triage.run_scan(self.report)
+        self.assertFalse(self.report.counting)
+        self.assertFalse(self.report.scan_complete)
+        self.assertEqual(self.report.completed_items, 0)
+        self.report.finish(False)
+        self.assertFalse(self.rows("summary")[0]["scan_finished"])
 
     def test_snapshot_output_and_time_are_bounded(self):
         data, rc, reason = triage.capture_bounded([sys.executable, "-c", "import os; os.write(1,b'x'*1000000)"], limit=1024)
@@ -240,6 +505,25 @@ class LinuxFixtureTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256((self.out / name).read_bytes()).hexdigest(), digest)
         self.assertEqual(stat.S_IMODE((self.out / "files.jsonl").stat().st_mode), 0o600)
 
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "Token ownership check requires root")
+    def test_notification_token_requires_private_regular_file(self):
+        token = self.root / "notify.token"
+        token.write_text("private-token\n")
+        token.chmod(0o600)
+        self.assertEqual(triage.read_notification_token(str(token)), "private-token")
+        token.chmod(0o644)
+        with self.assertRaises(ValueError):
+            triage.read_notification_token(str(token))
+        token.chmod(0o600)
+        link = self.root / "token-link"
+        link.symlink_to(token)
+        with self.assertRaises(OSError):
+            triage.read_notification_token(str(link))
+        for content in ("", "token\nInjected: header", "x" * 4097):
+            token.write_text(content)
+            with self.assertRaises(ValueError):
+                triage.read_notification_token(str(token))
+
     @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "Isolated chroot CLI test requires root")
     def test_full_cli_in_isolated_filesystem(self):
         # The child sees only this fixture tree. No production /home, /etc or /root
@@ -252,23 +536,53 @@ class LinuxFixtureTests(unittest.TestCase):
             "import os,sys,importlib.util,_strptime,encodings.ascii; "
             "s=importlib.util.spec_from_file_location('triage',sys.argv[1]+'/runcloud-triage.py'); "
             "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+            "m.send_notification=lambda args,payload,token=None: print('CALLBACK '+m.json.dumps(payload)) or False; "
             "os.chroot(sys.argv[1]); os.chdir('/'); m.__file__='/runcloud-triage.py'; "
             "sys.argv=['runcloud-triage.py']+sys.argv[2:]; sys.exit(m.main())"
         )
         clean = subprocess.run([sys.executable, "-c", code, str(jail)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(clean.returncode, 0, clean.stdout.decode() + clean.stderr.decode())
+        self.assertIn(b"Counting files:", clean.stdout)
+        self.assertIn(b"100%", clean.stdout)
+        self.assertNotIn(b"CALLBACK ", clean.stdout)
+        quick = subprocess.run([sys.executable, "-c", code, str(jail), "--quick", "--no-precount"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(quick.returncode, 0, quick.stdout.decode() + quick.stderr.decode())
+        self.assertNotIn(b"Counting files:", quick.stdout)
+        self.assertIn(b"Quick mode:", quick.stdout)
+        notify_args = ["--notify-url", "http://example.test/hook?private=url"]
+        notified_clean = subprocess.run([sys.executable, "-c", code, str(jail)] + notify_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(notified_clean.returncode, 0)
         (jail / "home/user/webapps/site/example.jpg").write_bytes(request_sample())
         review = subprocess.run([sys.executable, "-c", code, str(jail)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(review.returncode, 1, review.stdout.decode() + review.stderr.decode())
+        notified_review = subprocess.run([sys.executable, "-c", code, str(jail)] + notify_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(notified_review.returncode, 1)
         incomplete = subprocess.run([sys.executable, "-c", code, str(jail), "--home", "/missing"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(incomplete.returncode, 2, incomplete.stdout.decode() + incomplete.stderr.decode())
+        notified_incomplete = subprocess.run([sys.executable, "-c", code, str(jail), "--home", "/missing"] + notify_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(notified_incomplete.returncode, 2)
+        notified_init = subprocess.run([sys.executable, "-c", code, str(jail), "--output-parent", "/missing"] + notify_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(notified_init.returncode, 2)
+        interrupted_code = code.replace("sys.exit(m.main())", "m.run_scan=lambda report: (_ for _ in ()).throw(KeyboardInterrupt()); sys.exit(m.main())")
+        notified_interrupted = subprocess.run([sys.executable, "-c", interrupted_code, str(jail)] + notify_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(notified_interrupted.returncode, 2)
+        for result, status, finalized in ((notified_clean, "completed", True), (notified_review, "review_required", True),
+                                          (notified_incomplete, "incomplete", True), (notified_init, "incomplete", False),
+                                          (notified_interrupted, "incomplete", True)):
+            callbacks = [json.loads(line[len("CALLBACK "):]) for line in result.stdout.decode().splitlines() if line.startswith("CALLBACK ")]
+            self.assertEqual(len(callbacks), 1)
+            self.assertEqual(callbacks[0]["status"], status)
+            self.assertEqual(callbacks[0]["report_finalized"], finalized)
+            self.assertEqual(callbacks[0]["exit_code"], result.returncode)
         reports = list((jail / "root").glob("runcloud-triage-*"))
-        self.assertEqual(len(reports), 3)
+        self.assertEqual(len(reports), 8)
         for report in reports:
             self.assertEqual(stat.S_IMODE(report.stat().st_mode), 0o700)
             for artifact in report.iterdir():
                 self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
             self.assertTrue((report / "SHA256SUMS").exists())
+            saved_options = json.loads((report / "summary.jsonl").read_text())["options"]
+            self.assertIn(saved_options["notify_url"], (None, "[configured]"))
 
 
 if __name__ == "__main__":
