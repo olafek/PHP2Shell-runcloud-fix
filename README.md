@@ -28,7 +28,7 @@ id -u
 command -v curl
 ```
 
-`id -u` must print `0`. Python must be 3.6 or newer. Ubuntu 18.04's Python 3.6 is supported; the installed PHP version does not matter to the scanner.
+`id -u` must print `0`. Python must be 3.6 or newer, including Ubuntu 18.04's Python 3.6 and Ubuntu 20.04's Python 3.8. Use the system `/usr/bin/python3`; no Python or PHP upgrade is required. The installed PHP version does not matter to the scanner.
 
 If Python or curl is missing, the following installs them. **This optional prerequisite step changes the server; the scanner itself does not install anything.** Old Ubuntu releases may need your existing archive/ESM repository configuration to work. Do not change repository sources just to run a scan without first reviewing that server's maintenance arrangements.
 
@@ -39,23 +39,20 @@ apt-get install --no-install-recommends python3 curl ca-certificates
 
 ## 3. Download inside the SSH session
 
-Run these commands as root, one line at a time. Each command is complete on its own line. Keep the scanner outside website directories.
+Paste this entire block as root into a fresh SSH prompt, then press Enter. It works in Bash and `/bin/sh` on Ubuntu 18.04, 20.04 and newer. Each step runs only if the preceding step succeeds. Keep the scanner outside website directories.
 
 ```bash
-install -d -o root -g root -m 0700 /root/runcloud-triage
-cd /root/runcloud-triage
-umask 077
-
-TRIAGE_REF='master'
-TRIAGE_RAW_BASE="https://raw.githubusercontent.com/olafek/PHP2Shell-runcloud-fix/$TRIAGE_REF"
-
-curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py" -o runcloud-triage.py
-
-curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py.sha256" -o runcloud-triage.py.sha256
-
-sha256sum --check runcloud-triage.py.sha256
-
-chmod 0600 runcloud-triage.py runcloud-triage.py.sha256
+(
+    umask 077 &&
+    install -d -o root -g root -m 0700 /root/runcloud-triage &&
+    cd /root/runcloud-triage &&
+    TRIAGE_REF='master' &&
+    TRIAGE_RAW_BASE="https://raw.githubusercontent.com/olafek/PHP2Shell-runcloud-fix/$TRIAGE_REF" &&
+    curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py" -o runcloud-triage.py &&
+    curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py.sha256" -o runcloud-triage.py.sha256 &&
+    sha256sum --check runcloud-triage.py.sha256 &&
+    chmod 0600 runcloud-triage.py runcloud-triage.py.sha256
+);
 ```
 
 **Continue to step 4 only if both downloads succeeded and the checksum says `OK`.** Do not pipe the remote script into a root shell. No executable bit, service installation, cron job, pip package, or PHP extension is required.
@@ -66,13 +63,15 @@ The checksum detects transfer/file mismatches. A checksum downloaded from the sa
 
 ## 4. Run it
 
-**Only if you want the result sent to a site:** create the token file before the first run on each server. Skip this step otherwise. If the receiving site gives you a ready-made token-file line, paste that instead. Otherwise run this, paste the site's token when it waits for input (nothing is shown), and press Enter:
+**Only if you want the result sent to a site:** create the token file before the first run on each server. Skip this step otherwise. If the receiving site gives you a ready-made token-file line, paste that instead. Run each step at a fresh prompt; do not append it to an unexecuted command. Otherwise run this, paste the site's token when it waits for input (nothing is shown), and press Enter. This explicitly starts Bash for its hidden-input `read` option, so it also works when your login shell is `/bin/sh`:
 
 ```bash
-read -rs NOTIFY_TOKEN && install -m 600 /dev/null /root/runcloud-triage-notify.token && printf '%s\n' "$NOTIFY_TOKEN" > /root/runcloud-triage-notify.token && unset NOTIFY_TOKEN
+bash -c 'read -r -s -p "Server Scan Token: " NOTIFY_TOKEN && printf "\n" && install -m 600 /dev/null /root/runcloud-triage-notify.token && printf "%s\n" "$NOTIFY_TOKEN" > /root/runcloud-triage-notify.token';
 ```
 
 The file is root-only (`0600`) and is reused by later runs, so this is a one-time step per server unless the token changes. Then add `--notify-url 'https://your-site.example/...' --notify-token-file /root/runcloud-triage-notify.token` to the run command below; see [Optional completion callback](#optional-completion-callback).
+
+**If you see `chmod: invalid option -- 'm'`:** two commands were joined without a separator, such as `chmod ... install -m 600 ...`. This is a shell command boundary error on any Ubuntu version. Press Ctrl+C to clear the current input, then run the download and token steps separately. To intentionally join commands, use `&&` between them; a space is not a separator. Keep the final `;` when copying the setup commands above.
 
 Basic run on every server:
 

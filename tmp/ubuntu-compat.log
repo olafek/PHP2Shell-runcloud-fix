@@ -1,0 +1,4 @@
+Validation workspace: /var/tmp/triage-ubuntu-compat-20261022
+gpgv: Signature made Fri Apr 27 01:38:40 2018 SAST
+gpgv:                using RSA key 3B4FE6ACC0B21F32
+gpgv: Good signature from "Ubuntu Archive Automatic Signing Key (2012) <ftpmaster@ubuntu.com>"
