@@ -56,10 +56,11 @@ curl --fail --show-error --silent --location --proto '=https' --proto-redir '=ht
 
 sha256sum --check runcloud-triage.py.sha256
 chmod 0600 runcloud-triage.py runcloud-triage.py.sha256
-less runcloud-triage.py
 ```
 
-**Continue only if both downloads succeeded and the checksum says `OK`.** Download and inspect the file; do not pipe the remote script into a root shell. No executable bit, service installation, cron job, pip package, or PHP extension is required.
+**Continue to step 4 only if both downloads succeeded and the checksum says `OK`.** Do not pipe the remote script into a root shell. No executable bit, service installation, cron job, pip package, or PHP extension is required.
+
+**Optional code review:** `less runcloud-triage.py` opens the source code for inspection; it does not run the scanner. Press `q` to exit and continue to step 4. You do not need to edit the file or open it in `nano`.
 
 The checksum detects transfer/file mismatches. A checksum downloaded from the same repository is **not independent authentication** of that repository.
 
