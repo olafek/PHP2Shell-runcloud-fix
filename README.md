@@ -51,13 +51,16 @@ Paste this entire block as root into a fresh SSH prompt, then press Enter. It wo
     curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py" -o runcloud-triage.py &&
     curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py.sha256" -o runcloud-triage.py.sha256 &&
     sha256sum --check runcloud-triage.py.sha256 &&
-    chmod 0600 runcloud-triage.py runcloud-triage.py.sha256
+    chmod 0600 runcloud-triage.py runcloud-triage.py.sha256 &&
+    grep -m1 '^VERSION' runcloud-triage.py
 );
 ```
 
-**Continue to step 4 only if both downloads succeeded and the checksum says `OK`.** Do not pipe the remote script into a root shell. No executable bit, service installation, cron job, pip package, or PHP extension is required.
+The parentheses keep `umask` and `cd` inside the block, so afterwards your prompt is back in the folder you started from. Later commands therefore use full paths such as `/root/runcloud-triage/runcloud-triage.py`.
 
-**Optional code review:** `less runcloud-triage.py` displays the source code; it does not run the scanner. Press `q` to exit and continue to step 4. You do not need to edit the file or open it in `nano`.
+**Continue to step 4 only if both downloads succeeded, the checksum says `OK` and the last line shows the expected `VERSION`.** Do not pipe the remote script into a root shell. No executable bit, service installation, cron job, pip package, or PHP extension is required.
+
+**Optional code review:** `less /root/runcloud-triage/runcloud-triage.py` displays the source code; it does not run the scanner. Press `q` to exit and continue to step 4. You do not need to edit the file or open it in `nano`.
 
 The checksum detects transfer/file mismatches. A checksum downloaded from the same repository is **not independent authentication** of that repository.
 
