@@ -36,7 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 MIB = 1024 * 1024
 # Not named runcloud-triage-* so it is never mistaken for (or globbed with) a report folder.
 QUARANTINE_DIR = "/root/runcloud-quarantine"
@@ -46,6 +46,8 @@ UTC = dt.timezone.utc
 PHP_EXT = re.compile(r"\.(?:php\d*|phtml|pht|phar|inc)(?:\.|$)", re.I)
 LOG_NAME = re.compile(r"(?:\.log(?:[.\-].*)?$|^(?:syslog|messages|kern\.log)(?:\.\d+)?(?:\.gz)?$)", re.I)
 ARCHIVE_EXT = (".zip", ".gz", ".bz2", ".xz", ".7z", ".tar", ".rar", ".phar")
+PHP_TAG = re.compile(rb"<\?(?:php\b|=)", re.I)
+PHP_CODE_HINT = re.compile(rb"[$(;]|\?>")
 INPUT = rb"\$_(?:GET|POST|REQUEST|COOKIE|FILES|SERVER)\s*\["
 RULES = [
     ("HIGH", "request_to_execution", re.compile(
@@ -176,12 +178,24 @@ def metadata(path, st):
             "ctime_utc": utc(st.st_ctime), "device": st.st_dev, "inode": st.st_ino}
 
 
+def readable_php_tag(data):
+    """In binary data "<?=" occurs by chance (about once per 16 MiB of compressed image data).
+    Count a tag there only when readable, PHP-like text follows it, as in a disguised script."""
+    for match in PHP_TAG.finditer(data):
+        after = data[match.end():match.end() + 48].lstrip()
+        printable = sum(1 for byte in after if 32 <= byte < 127 or byte in (9, 10, 13))
+        if len(after) >= 3 and printable >= 0.9 * len(after) and PHP_CODE_HINT.search(after):
+            return True
+    return False
+
+
 def file_rules(path, data, persistence=False):
     """Heuristics, not proof of exploitation or attribution to either CVE."""
     name = Path(path).name.lower()
     lower = path.lower().replace("\\", "/")
     php_extension = bool(PHP_EXT.search(name))
-    has_php = bool(re.search(rb"<\?(?:php\b|=)", data, re.I))
+    # NUL bytes near the start mean binary content (images, fonts, archives...).
+    has_php = readable_php_tag(data) if b"\0" in data[:8192] else bool(PHP_TAG.search(data))
     results = []
     if has_php or php_extension or persistence:
         for severity, rule, pattern, reason in RULES:

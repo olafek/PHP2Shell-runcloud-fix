@@ -5,11 +5,273 @@ gpgv: Good signature from "Ubuntu Archive Automatic Signing Key (2012) <ftpmaste
 gpgv: Signature made Thu Oct 22 08:56:27 2026 SAST
 gpgv:                using RSA key 790BC7277767219C42C86F933B4FE6ACC0B21F32
 gpgv: Good signature from "Ubuntu Archive Automatic Signing Key (2012) <ftpmaster@ubuntu.com>"
-Downloading curl
-Downloading zlib1g
-Downloading libc6
-Downloading libgcc1
-Downloading gcc-8-base
-Downloading libssl1.1
-Downloading debconf
-Downloading libcurl4
+Python 3.6.9
+test_download_and_token_commands_remain_separate_when_newlines_become_spaces (test_setup.SetupTests) ... ok
+test_download_failure_or_checksum_mismatch_does_not_finish_setup (test_setup.SetupTests) ... ok
+test_automatic_include_requires_review (test_triage.DetectionTests) ... ok
+test_chance_php_tag_bytes_in_a_binary_image_are_ignored (test_triage.DetectionTests) ... ok
+test_dates (test_triage.DetectionTests) ... ok
+test_disguised_php_upload (test_triage.DetectionTests) ... ok
+test_encoded_execution (test_triage.DetectionTests) ... ok
+test_encoded_log_marker (test_triage.DetectionTests) ... ok
+test_normal_decoder_and_generated_view (test_triage.DetectionTests) ... ok
+test_normal_post_is_context_only (test_triage.DetectionTests) ... ok
+test_python36_grammar (test_triage.DetectionTests) ... skipped 'AST grammar selection needs newer Python'
+test_readable_php_hidden_in_a_binary_image_is_still_found (test_triage.DetectionTests) ... ok
+test_request_callable (test_triage.DetectionTests) ... ok
+test_request_execution (test_triage.DetectionTests) ... ok
+test_short_echo_tag_with_code_in_a_binary_file_is_found (test_triage.DetectionTests) ... ok
+test_all_sites_vendor_old_releases_nonstandard_home (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:28+00:00] Starting | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_corrupt_gzip (test_triage.LinuxFixtureTests) ... ok
+test_counting_uses_same_targets_without_reading_content_or_duplicating_records (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:28+00:00] Starting | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_decompression_and_total_log_limits (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:28+00:00] Scanning logs | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_disappearing_files_adjust_total_at_finish (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:28+00:00] Counting files: 0 found | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:28+00:00] [----------]   0% 0/3 | ETA estimating | Elapsed 00:00:00 | Files | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:28+00:00] [##########] 100% 1/1 | ETA 00:00:00 | Elapsed 00:00:00 | Scan complete | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_does_not_scan_own_output (test_triage.LinuxFixtureTests) ... ok
+test_failed_counting_falls_back_to_scan_without_eta (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:28+00:00] Counting files: 0 found | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:28+00:00] 0 finished | ETA unavailable | Elapsed 00:00:00 | Files | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:28+00:00] 0 finished | ETA unavailable | Elapsed 00:00:00 | Scan complete | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_full_cli_in_isolated_filesystem (test_triage.LinuxFixtureTests) ... ok
+test_interrupt_during_counting_leaves_partial_report (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:29+00:00] Counting files: 0 found | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:29+00:00] Writing report | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+
+RUNCLOUD INCIDENT TRIAGE 1.5.0
+Host: LLM-imedia8
+Report: /tmp/runcloud-triage-test-j3yj0nuo/report
+Started UTC: 2026-10-22T14:42:29+00:00
+Finished UTC: 2026-10-22T14:42:29+00:00
+Scan finished: False
+Result: NO_MATCHING_INDICATORS
+Not a clean bill of health. Indicators are heuristics, not proof. Review coverage and inventories.
+
+Indicators: {}
+Counts: {}
+ok
+test_newline_paths_are_escaped (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:29+00:00] Scanning files | Elapsed 00:00:00 | Matches=2 HIGH=1 REVIEW=1 INFO=0
+ok
+test_no_precount_uses_one_pass (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:29+00:00] 0 finished | ETA unavailable | Elapsed 00:00:00 | Files | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:29+00:00] 1 finished | ETA unavailable | Elapsed 00:00:00 | Scan complete | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_notification_token_requires_private_regular_file (test_triage.LinuxFixtureTests) ... ok
+test_partial_hash_is_not_full_hash (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:29+00:00] Scanning files | Elapsed 00:00:00 | Matches=1 HIGH=0 REVIEW=1 INFO=0
+ok
+test_plain_and_compressed_logs (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:29+00:00] Scanning logs | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_progress_accounts_for_new_files_and_failed_attempts (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:29+00:00] Counting files: 0 found | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:29+00:00] [----------]   0% 0/1 | ETA estimating | Elapsed 00:00:00 | Files | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:29+00:00] [##########] 100% 2/2 | ETA 00:00:00 | Elapsed 00:00:00 | Scan complete | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_read_error_is_explicit (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:29+00:00] Scanning files | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_sample_limit_does_not_hide_later_review_count (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:29+00:00] Scanning logs | Elapsed 00:00:00 | Matches=1 HIGH=0 REVIEW=0 INFO=1
+ok
+test_snapshot_output_and_time_are_bounded (test_triage.LinuxFixtureTests) ... ok
+test_summary_manifest_permissions (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:30+00:00] Scanning files | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:30+00:00] Writing report | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+
+RUNCLOUD INCIDENT TRIAGE 1.5.0
+Host: LLM-imedia8
+Report: /tmp/runcloud-triage-test-mdy32g9t/report
+Started UTC: 2026-10-22T14:42:30+00:00
+Finished UTC: 2026-10-22T14:42:30+00:00
+Scan finished: True
+Result: NO_MATCHING_INDICATORS
+Not a clean bill of health. Indicators are heuristics, not proof. Review coverage and inventories.
+
+Indicators: {}
+Counts: {"files": 1}
+ok
+test_symlink_ancestor_link_and_fifo_not_read (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:30+00:00] Starting | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_traversal_avoids_python37_scandir_fd (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:30+00:00] Starting | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_failure_is_not_retried_and_does_not_print_secrets (test_triage.NotificationTests) ... ok
+test_full_findings_post_exceeds_preview_limit_and_filters_evidence (test_triage.NotificationTests) ... ok
+test_notification_timeout (test_triage.NotificationTests) ... ok
+test_payload_is_a_summary_without_paths_options_or_evidence (test_triage.NotificationTests) ... ok
+test_posts_json_with_optional_auth_and_ignores_proxy_environment (test_triage.NotificationTests) ... ok
+test_redirects_are_not_followed (test_triage.NotificationTests) ... ok
+test_requested_findings_on_initialization_failure_are_empty_not_a_clean_scan (test_triage.NotificationTests) ... ok
+test_total_deadline_bounds_blocking_setup_and_restores_alarm (test_triage.NotificationTests) ... ok
+test_explicit_limits_override_quick_in_either_order (test_triage.OptionTests) ... ok
+test_notification_options_validate_before_scanning (test_triage.OptionTests) ... ok
+test_standard_and_quick_limits (test_triage.OptionTests) ... ok
+test_empty_and_unknown_totals (test_triage.ProgressTests) ... ok
+test_percentage_eta_and_completion (test_triage.ProgressTests) ... ok
+test_progress_includes_repeated_unsaved_matches_and_severity (test_triage.ProgressTests) ... ok
+test_redirected_output_is_plain_and_rate_limited (test_triage.ProgressTests) ... ok
+test_terminal_updates_one_line_and_respects_width (test_triage.ProgressTests) ... ok
+test_actions_are_exclusive_and_do_not_take_notification_options (test_triage.QuarantineOptionTests) ... ok
+test_a_file_already_gone_is_reported_not_moved (test_triage.QuarantineTests) ... ok
+test_a_file_changed_since_the_scan_is_left_alone (test_triage.QuarantineTests) ... ok
+test_a_partially_read_file_matches_on_its_recorded_prefix_and_size (test_triage.QuarantineTests) ... ok
+test_a_partially_read_file_that_grew_is_left_alone (test_triage.QuarantineTests) ... ok
+test_a_symlinked_parent_directory_is_never_followed (test_triage.QuarantineTests) ... ok
+test_an_invalid_choice_is_asked_again (test_triage.QuarantineTests) ... ok
+test_every_action_is_logged (test_triage.QuarantineTests) ... ok
+test_lists_each_flagged_file_once_high_first_without_log_evidence (test_triage.QuarantineTests) ... ok
+test_other_hard_links_are_reported (test_triage.QuarantineTests) ... ok
+test_prompt_moves_only_the_chosen_files_after_confirmation (test_triage.QuarantineTests) ... ok
+test_purge_deletes_only_the_chosen_copy (test_triage.QuarantineTests) ... ok
+test_purge_prompt_needs_the_word_delete (test_triage.QuarantineTests) ... ok
+test_quarantine_moves_the_file_into_a_private_copy (test_triage.QuarantineTests) ... ok
+test_report_and_quarantine_folders_must_be_private (test_triage.QuarantineTests) ... ok
+test_restore_never_overwrites_a_newer_file (test_triage.QuarantineTests) ... ok
+test_restore_prompt_restores_the_chosen_file (test_triage.QuarantineTests) ... ok
+test_restore_puts_the_file_back_exactly (test_triage.QuarantineTests) ... ok
+test_skipping_declining_or_closing_the_prompt_changes_nothing (test_triage.QuarantineTests) ... ok
+test_numbers_ranges_and_shortcuts (test_triage.SelectionTests) ... ok
+test_out_of_range_or_unknown_choices_are_rejected (test_triage.SelectionTests) ... ok
+
+----------------------------------------------------------------------
+Ran 73 tests in 5.653s
+
+OK (skipped=1)
+PASS: bionic 3.6 scanner suite, --help, bash/dash setup commands
+gpgv: Signature made Thu Apr 23 19:34:17 2020 SAST
+gpgv:                using RSA key 3B4FE6ACC0B21F32
+gpgv: Good signature from "Ubuntu Archive Automatic Signing Key (2012) <ftpmaster@ubuntu.com>"
+gpgv: Signature made Thu Apr 23 19:34:17 2020 SAST
+gpgv:                using RSA key 871920D1991BC93C
+gpgv: Good signature from "Ubuntu Archive Automatic Signing Key (2018) <ftpmaster@ubuntu.com>"
+gpgv: Signature made Thu Oct 22 08:53:35 2026 SAST
+gpgv:                using RSA key 790BC7277767219C42C86F933B4FE6ACC0B21F32
+gpgv: Good signature from "Ubuntu Archive Automatic Signing Key (2012) <ftpmaster@ubuntu.com>"
+gpgv: Signature made Thu Oct 22 08:53:35 2026 SAST
+gpgv:                using RSA key F6ECB3762474EDA9D21B7022871920D1991BC93C
+gpgv: Good signature from "Ubuntu Archive Automatic Signing Key (2018) <ftpmaster@ubuntu.com>"
+Python 3.8.10
+test_download_and_token_commands_remain_separate_when_newlines_become_spaces (test_setup.SetupTests) ... ok
+test_download_failure_or_checksum_mismatch_does_not_finish_setup (test_setup.SetupTests) ... ok
+test_automatic_include_requires_review (test_triage.DetectionTests) ... ok
+test_chance_php_tag_bytes_in_a_binary_image_are_ignored (test_triage.DetectionTests) ... ok
+test_dates (test_triage.DetectionTests) ... ok
+test_disguised_php_upload (test_triage.DetectionTests) ... ok
+test_encoded_execution (test_triage.DetectionTests) ... ok
+test_encoded_log_marker (test_triage.DetectionTests) ... ok
+test_normal_decoder_and_generated_view (test_triage.DetectionTests) ... ok
+test_normal_post_is_context_only (test_triage.DetectionTests) ... ok
+test_python36_grammar (test_triage.DetectionTests) ... ok
+test_readable_php_hidden_in_a_binary_image_is_still_found (test_triage.DetectionTests) ... ok
+test_request_callable (test_triage.DetectionTests) ... ok
+test_request_execution (test_triage.DetectionTests) ... ok
+test_short_echo_tag_with_code_in_a_binary_file_is_found (test_triage.DetectionTests) ... ok
+test_all_sites_vendor_old_releases_nonstandard_home (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:35+00:00] Starting | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_corrupt_gzip (test_triage.LinuxFixtureTests) ... ok
+test_counting_uses_same_targets_without_reading_content_or_duplicating_records (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:35+00:00] Starting | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_decompression_and_total_log_limits (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:35+00:00] Scanning logs | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_disappearing_files_adjust_total_at_finish (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:35+00:00] Counting files: 0 found | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:35+00:00] [----------]   0% 0/3 | ETA estimating | Elapsed 00:00:00 | Files | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:35+00:00] [##########] 100% 1/1 | ETA 00:00:00 | Elapsed 00:00:00 | Scan complete | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_does_not_scan_own_output (test_triage.LinuxFixtureTests) ... ok
+test_failed_counting_falls_back_to_scan_without_eta (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:35+00:00] Counting files: 0 found | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:35+00:00] 0 finished | ETA unavailable | Elapsed 00:00:00 | Files | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:35+00:00] 0 finished | ETA unavailable | Elapsed 00:00:00 | Scan complete | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_full_cli_in_isolated_filesystem (test_triage.LinuxFixtureTests) ... ok
+test_interrupt_during_counting_leaves_partial_report (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:36+00:00] Counting files: 0 found | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:36+00:00] Writing report | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+
+RUNCLOUD INCIDENT TRIAGE 1.5.0
+Host: LLM-imedia8
+Report: /tmp/runcloud-triage-test-7swc4d29/report
+Started UTC: 2026-10-22T14:42:36+00:00
+Finished UTC: 2026-10-22T14:42:36+00:00
+Scan finished: False
+Result: NO_MATCHING_INDICATORS
+Not a clean bill of health. Indicators are heuristics, not proof. Review coverage and inventories.
+
+Indicators: {}
+Counts: {}
+ok
+test_newline_paths_are_escaped (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:36+00:00] Scanning files | Elapsed 00:00:00 | Matches=2 HIGH=1 REVIEW=1 INFO=0
+ok
+test_no_precount_uses_one_pass (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:36+00:00] 0 finished | ETA unavailable | Elapsed 00:00:00 | Files | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:36+00:00] 1 finished | ETA unavailable | Elapsed 00:00:00 | Scan complete | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_notification_token_requires_private_regular_file (test_triage.LinuxFixtureTests) ... ok
+test_partial_hash_is_not_full_hash (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:37+00:00] Scanning files | Elapsed 00:00:00 | Matches=1 HIGH=0 REVIEW=1 INFO=0
+ok
+test_plain_and_compressed_logs (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:37+00:00] Scanning logs | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_progress_accounts_for_new_files_and_failed_attempts (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:37+00:00] Counting files: 0 found | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:37+00:00] [----------]   0% 0/1 | ETA estimating | Elapsed 00:00:00 | Files | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:37+00:00] [##########] 100% 2/2 | ETA 00:00:00 | Elapsed 00:00:00 | Scan complete | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_read_error_is_explicit (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:37+00:00] Scanning files | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_sample_limit_does_not_hide_later_review_count (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:37+00:00] Scanning logs | Elapsed 00:00:00 | Matches=1 HIGH=0 REVIEW=0 INFO=1
+ok
+test_snapshot_output_and_time_are_bounded (test_triage.LinuxFixtureTests) ... ok
+test_summary_manifest_permissions (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:37+00:00] Scanning files | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+[2026-10-22T14:42:37+00:00] Writing report | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+
+RUNCLOUD INCIDENT TRIAGE 1.5.0
+Host: LLM-imedia8
+Report: /tmp/runcloud-triage-test-_lru35kw/report
+Started UTC: 2026-10-22T14:42:37+00:00
+Finished UTC: 2026-10-22T14:42:37+00:00
+Scan finished: True
+Result: NO_MATCHING_INDICATORS
+Not a clean bill of health. Indicators are heuristics, not proof. Review coverage and inventories.
+
+Indicators: {}
+Counts: {"files": 1}
+ok
+test_symlink_ancestor_link_and_fifo_not_read (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:37+00:00] Starting | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_traversal_avoids_python37_scandir_fd (test_triage.LinuxFixtureTests) ... [2026-10-22T14:42:37+00:00] Starting | Elapsed 00:00:00 | Matches=0 HIGH=0 REVIEW=0 INFO=0
+ok
+test_failure_is_not_retried_and_does_not_print_secrets (test_triage.NotificationTests) ... ok
+test_full_findings_post_exceeds_preview_limit_and_filters_evidence (test_triage.NotificationTests) ... ok
+test_notification_timeout (test_triage.NotificationTests) ... ok
+test_payload_is_a_summary_without_paths_options_or_evidence (test_triage.NotificationTests) ... ok
+test_posts_json_with_optional_auth_and_ignores_proxy_environment (test_triage.NotificationTests) ... ok
+test_redirects_are_not_followed (test_triage.NotificationTests) ... ok
+test_requested_findings_on_initialization_failure_are_empty_not_a_clean_scan (test_triage.NotificationTests) ... ok
+test_total_deadline_bounds_blocking_setup_and_restores_alarm (test_triage.NotificationTests) ... ok
+test_explicit_limits_override_quick_in_either_order (test_triage.OptionTests) ... ok
+test_notification_options_validate_before_scanning (test_triage.OptionTests) ... ok
+test_standard_and_quick_limits (test_triage.OptionTests) ... ok
+test_empty_and_unknown_totals (test_triage.ProgressTests) ... ok
+test_percentage_eta_and_completion (test_triage.ProgressTests) ... ok
+test_progress_includes_repeated_unsaved_matches_and_severity (test_triage.ProgressTests) ... ok
+test_redirected_output_is_plain_and_rate_limited (test_triage.ProgressTests) ... ok
+test_terminal_updates_one_line_and_respects_width (test_triage.ProgressTests) ... ok
+test_actions_are_exclusive_and_do_not_take_notification_options (test_triage.QuarantineOptionTests) ... ok
+test_a_file_already_gone_is_reported_not_moved (test_triage.QuarantineTests) ... ok
+test_a_file_changed_since_the_scan_is_left_alone (test_triage.QuarantineTests) ... ok
+test_a_partially_read_file_matches_on_its_recorded_prefix_and_size (test_triage.QuarantineTests) ... ok
+test_a_partially_read_file_that_grew_is_left_alone (test_triage.QuarantineTests) ... ok
+test_a_symlinked_parent_directory_is_never_followed (test_triage.QuarantineTests) ... ok
+test_an_invalid_choice_is_asked_again (test_triage.QuarantineTests) ... ok
+test_every_action_is_logged (test_triage.QuarantineTests) ... ok
+test_lists_each_flagged_file_once_high_first_without_log_evidence (test_triage.QuarantineTests) ... ok
+test_other_hard_links_are_reported (test_triage.QuarantineTests) ... ok
+test_prompt_moves_only_the_chosen_files_after_confirmation (test_triage.QuarantineTests) ... ok
+test_purge_deletes_only_the_chosen_copy (test_triage.QuarantineTests) ... ok
+test_purge_prompt_needs_the_word_delete (test_triage.QuarantineTests) ... ok
+test_quarantine_moves_the_file_into_a_private_copy (test_triage.QuarantineTests) ... ok
+test_report_and_quarantine_folders_must_be_private (test_triage.QuarantineTests) ... ok
+test_restore_never_overwrites_a_newer_file (test_triage.QuarantineTests) ... ok
+test_restore_prompt_restores_the_chosen_file (test_triage.QuarantineTests) ... ok
+test_restore_puts_the_file_back_exactly (test_triage.QuarantineTests) ... ok
+test_skipping_declining_or_closing_the_prompt_changes_nothing (test_triage.QuarantineTests) ... ok
+test_numbers_ranges_and_shortcuts (test_triage.SelectionTests) ... ok
+test_out_of_range_or_unknown_choices_are_rejected (test_triage.SelectionTests) ... ok
+
+----------------------------------------------------------------------
+Ran 73 tests in 5.571s
+
+OK
+PASS: focal 3.8 scanner suite, --help, bash/dash setup commands

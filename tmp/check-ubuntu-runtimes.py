@@ -85,6 +85,10 @@ def check(suite, version):
         archives = list(pool.map(fetch, selected.values()))
     for archive in archives:
         subprocess.run(["dpkg-deb", "--extract", str(archive), str(root)], check=True)
+    if not (root / "bin/sh").is_symlink():
+        (root / "bin/sh").symlink_to("dash")
+    (root / "etc/passwd").write_text("root:x:0:0:root:/root:/bin/bash\n")
+    (root / "etc/group").write_text("root:x:0:\n")
     (root / "tmp").mkdir(exist_ok=True, mode=0o1777)
     (root / "dev").mkdir(exist_ok=True)
     if not (root / "dev/null").exists():
@@ -92,6 +96,7 @@ def check(suite, version):
     testdir = root / "work"
     testdir.mkdir(exist_ok=True)
     shutil.copy2(str(SOURCE / "runcloud-triage.py"), str(testdir))
+    shutil.copy2(str(SOURCE / "README.md"), str(testdir))
     shutil.copytree(str(SOURCE / "tests"), str(testdir / "tests"), ignore=shutil.ignore_patterns("__pycache__"), dirs_exist_ok=True)
     python = "/usr/bin/python" + version
     subprocess.run(["chroot", str(root), python, "--version"], check=True)

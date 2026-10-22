@@ -54,6 +54,23 @@ class DetectionTests(unittest.TestCase):
         result = self.rules("/home/a/webapps/b/wp-content/uploads/image.jpg", b"\xff\xd8\xff" + request_sample())
         self.assertTrue({"request_to_execution", "php_in_other_file_type", "php_in_writable_directory"} <= result)
 
+    def test_chance_php_tag_bytes_in_a_binary_image_are_ignored(self):
+        # Compressed image data contains "<?=" by chance; random bytes follow it, not PHP.
+        photo = (b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01" + bytes(range(256)) * 4
+                 + b"<" + b"?=\x13\x88\xfe\x01\x00\x9c" + bytes(range(255, -1, -1)) * 4)
+        path = "/home/a/webapps/b/wp-content/uploads/2023/01/photo-2048x1366.jpg"
+        self.assertEqual(self.rules(path, photo), set())
+        self.assertFalse(triage.file_rules(path, photo)[1])
+
+    def test_readable_php_hidden_in_a_binary_image_is_still_found(self):
+        polyglot = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01" + bytes(range(256)) + request_sample()
+        result = self.rules("/home/a/webapps/b/wp-content/uploads/photo.jpg", polyglot)
+        self.assertTrue({"request_to_execution", "php_in_other_file_type", "php_in_writable_directory"} <= result)
+
+    def test_short_echo_tag_with_code_in_a_binary_file_is_found(self):
+        gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00" + b"<" + b"?=$t" + b"itle ?>"
+        self.assertIn("php_in_other_file_type", self.rules("/home/a/webapps/b/uploads/pixel.gif", gif))
+
     def test_normal_decoder_and_generated_view(self):
         self.assertFalse(self.rules("/home/a/vendor/pkg/a.php", sample(b"return base64_decode($payload);")))
         self.assertFalse(self.rules("/home/a/storage/framework/views/a.php", sample(b"echo htmlspecialchars($name);")))

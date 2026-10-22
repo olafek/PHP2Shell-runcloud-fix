@@ -187,7 +187,7 @@ An example payload for a completed scan with indicators to review:
 {
   "schema_version": 1,
   "event": "runcloud-triage.finished",
-  "scanner_version": "1.4.0",
+  "scanner_version": "1.5.0",
   "run_id": "runcloud-triage-web-01-20261022T120000Z-a1b2c3d4",
   "hostname": "web-01",
   "started_utc": "2026-10-22T12:00:00+00:00",
@@ -297,6 +297,8 @@ Files are created only when there are records for them, so some files may be abs
 - **HIGH:** prioritise source review. Examples include request data passed directly to an execution function or encoded content passed to `eval`. Test fixtures, documentation and legitimate loaders can match; this is not a confirmed compromise verdict.
 - **REVIEW:** investigate context. Examples include PHP in uploads, automatic includes, memory failures, crashed workers or a running deleted executable. Security plugins, normal application failures and package upgrades can explain some matches.
 - **INFO:** supporting context, including ordinary fatal errors and successful SSH logins. These are still useful when correlating a timeline.
+
+**Binary files (since 1.5.0).** Compressed image data contains the bytes `<?=` by chance: in one sample of 3,000 ordinary images over 100 KB, 418 contained them. In a file with NUL bytes in its first 8 KiB (images, fonts, archives and other binary formats), a PHP opening tag therefore only counts when readable, PHP-like text follows it (printable characters including `$`, `(`, `;` or `?>`). Scripts hidden in images, including real images with PHP appended, are still reported as `php_in_other_file_type`, `php_in_writable_directory` and any matching HIGH rule. Text files and PHP-named files are checked as before.
 
 `REVIEW_REQUIRED` means at least one HIGH or REVIEW indicator was counted. `NO_MATCHING_INDICATORS` means these rules found none; it does **not** mean “safe” or “never attacked.” Always check `scan_finished` and coverage separately.
 
@@ -432,7 +434,7 @@ python3 -m py_compile runcloud-triage.py
 
 Linux filesystem fixtures test symlink/FIFO handling, age-independent coverage, report generation, compressed logs, limits and read failures. Detection and timestamp tests can also run on Windows; Linux-specific tests are skipped there. Python 3.6 grammar is checked on interpreters that provide AST grammar selection. Testing on a newer interpreter does not substitute for an end-to-end trial on your oldest server image.
 
-Validation for this version: **68 tests passed on Ubuntu 22.04 (WSL) with Python 3.10.12**, including isolated command-line runs exercising exit codes 0/1/2, report permissions, quick mode, and callbacks for completed/partial/interrupted runs; counting and ETA; notification authentication, redirects, deadlines, full findings beyond the preview limit, omitted-match counts, evidence filtering, and failure handling; and quarantine selection, hash/size matching, symlinked folders, hard links, exact restore of owner/mode/timestamps, refusal to overwrite, purge confirmation, the action log, and refusal without an interactive terminal. Notification transport tests use a local HTTP receiver and do not contact external services. Python 3.6 syntax and the APIs used for older-Ubuntu compatibility were checked; an actual Ubuntu 18.04/Python 3.6 runtime was not available for execution here.
+Validation for this version: **71 tests passed on Ubuntu 22.04 (WSL) with Python 3.10.12**, including chance PHP-tag bytes in binary images versus readable PHP hidden in images, isolated command-line runs exercising exit codes 0/1/2, report permissions, quick mode, and callbacks for completed/partial/interrupted runs; counting and ETA; notification authentication, redirects, deadlines, full findings beyond the preview limit, omitted-match counts, evidence filtering, and failure handling; and quarantine selection, hash/size matching, symlinked folders, hard links, exact restore of owner/mode/timestamps, refusal to overwrite, purge confirmation, the action log, and refusal without an interactive terminal. Notification transport tests use a local HTTP receiver and do not contact external services. Python 3.6 syntax and the APIs used for older-Ubuntu compatibility were checked; an actual Ubuntu 18.04/Python 3.6 runtime was not available for execution here.
 
 ### Publishing updates
 
