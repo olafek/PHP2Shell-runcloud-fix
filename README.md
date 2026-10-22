@@ -105,7 +105,45 @@ The patch time above is an **example**, not an assumed time for your servers. Om
 - **All discovered retained logs are considered regardless of date**, up to the reported byte limits. This includes evidence predating the recent-file window.
 - `--patched-at` labels a file's modification time as before/after the supplied time. It does not determine when an attacker gained access; `ctime` is inode-change time, not creation time.
 
-The terminal prints the exact report directory, collects system snapshots, then counts files before scanning their contents. In an interactive SSH terminal, one progress bar updates in place as work advances, up to four times per second. Redirected/piped output uses plain lines about every 15 seconds and at phase changes. Large servers can take a long time: the scanner reads files across `/home`, including media, dependencies and old releases. Keep the SSH session open or use an existing `tmux`/`screen` session. Ctrl+C attempts to save a clearly marked partial report; a killed process or full disk may prevent finalization.
+The terminal prints the exact report directory, collects system snapshots, then counts files before scanning their contents. In an interactive SSH terminal, one progress bar updates in place as work advances, up to four times per second. Redirected/piped output uses plain lines about every 15 seconds and at phase changes. Large servers can take a long time: the scanner reads files across `/home`, including media, dependencies and old releases. For a foreground run, keep the SSH session open or use an existing `tmux`/`screen` session. Use the background option below to let a scan finish after disconnecting. Ctrl+C attempts to save a clearly marked partial report; a killed process or full disk may prevent finalization.
+
+### Run in the background after SSH disconnects
+
+Choose this **instead of the foreground run** when you want to close SSH or protect against an accidental disconnect. It runs one scan to completion, using [GNU `nohup`](https://www.gnu.org/s/coreutils/manual/html_node/nohup-invocation.html) and the standard Ubuntu shell tools available on 18.04 and newer. It does not repeat scans or restart after a server reboot.
+
+Paste the whole block as root:
+
+```bash
+(
+    umask 077 &&
+    RUN_DIR=$(mktemp -d /root/runcloud-background.XXXXXX) &&
+    {
+        nohup /bin/sh -c 'run_dir=$1; shift; "$@"; result=$?; printf "%s\n" "$result" > "$run_dir/exit-code"; exit "$result"' sh "$RUN_DIR" /usr/bin/python3 -u -I /root/runcloud-triage/runcloud-triage.py < /dev/null > "$RUN_DIR/scan.log" 2>&1 &
+        printf '%s\n' "$!" > "$RUN_DIR/pid";
+        printf 'Background job: %s\nWatch: tail -f %s/scan.log\nExit code: cat %s/exit-code\n' "$RUN_DIR" "$RUN_DIR" "$RUN_DIR";
+    }
+);
+```
+
+For a callback, add your existing `--notify-url`, `--notify-token-file`, `--notify-findings` and other scan options **after `runcloud-triage.py` and before `< /dev/null`**. Streambrain's Server Scans page provides a background command with its callback options already included.
+
+The launch command returns immediately and prints a unique folder such as `/root/runcloud-background.a1B2c3`. That folder is mode `0700`; its log, launcher PID and eventual exit-code file are mode `0600`. Save the printed path. The first lines of `scan.log` show the separate private report directory, or an error if the scanner could not start. A successful launch alone does not mean the scan succeeded.
+
+After reconnecting, use the printed `tail -f` command to watch progress. **Ctrl+C stops watching the log; the background scan keeps running.** If you lost the path, list the run folders with `ls -dt /root/runcloud-background.*`. Replace `a1B2c3` below with your run's folder:
+
+```bash
+tail -f /root/runcloud-background.a1B2c3/scan.log
+```
+
+Check the saved result after it finishes:
+
+```bash
+cat /root/runcloud-background.a1B2c3/exit-code
+```
+
+`0` means no matching HIGH/REVIEW indicators, `1` means review is required, and `2` means incomplete/failed; review the report and coverage gaps in every case. Other codes can indicate a launch failure. If `exit-code` is absent, the job may still be running or may have been interrupted; check its log and `ps -p "$(cat /root/runcloud-background.a1B2c3/pid)" -o pid,etime,args`. The PID identifies the waiting launcher and can be reused after it exits.
+
+The configured completion callback still runs. Background scans have no interactive terminal and cannot prompt to quarantine files. Review the report after completion, then use `--quarantine REPORT_DIR` in a new interactive SSH session if needed. Do not start another scan just because the original SSH session closed.
 
 ### Reading the progress bar
 
@@ -435,16 +473,16 @@ python3 -m unittest discover -s tests -v
 python3 -m py_compile runcloud-triage.py
 ```
 
-Linux filesystem fixtures test symlink/FIFO handling, age-independent coverage, report generation, compressed logs, limits and read failures. `tests/test_setup.py` checks the README commands in Bash and `/bin/sh` with offline download fixtures, including pasted command boundaries, private permissions, failed downloads and checksum mismatches; run it as root in a disposable Linux environment. Detection and timestamp tests can also run on Windows; Linux-specific tests are skipped there. Python 3.6 grammar is checked on interpreters that provide AST grammar selection.
+Linux filesystem fixtures test symlink/FIFO handling, age-independent coverage, report generation, compressed logs, limits and read failures. `tests/test_setup.py` checks the README commands in Bash and `/bin/sh` with offline download fixtures, including pasted command boundaries, private permissions, failed downloads and checksum mismatches. Its background fixture verifies that jobs continue after the launching shell exits and a hangup signal arrives, detach all terminal streams, and save exit codes 0/1/2. Run the tests as root in a disposable Linux environment. Detection and timestamp tests can also run on Windows; Linux-specific tests are skipped there. Python 3.6 grammar is checked on interpreters that provide AST grammar selection.
 
-Validation for this version: **73 tests passed on Ubuntu 22.04 (WSL) with Python 3.10.12**, including chance PHP-tag bytes in binary images versus readable PHP hidden in images, isolated command-line runs exercising exit codes 0/1/2, report permissions, quick mode, and callbacks for completed/partial/interrupted runs; counting and ETA; notification authentication, redirects, deadlines, full findings beyond the preview limit, omitted-match counts, evidence filtering, and failure handling; and quarantine selection, hash/size matching, symlinked folders, hard links, exact restore of owner/mode/timestamps, refusal to overwrite, purge confirmation, the action log, and refusal without an interactive terminal. Notification transport tests use a local HTTP receiver and do not contact external services.
+Validation for this version: **74 tests passed on Ubuntu 22.04 (WSL) with Python 3.10.12**, including chance PHP-tag bytes in binary images versus readable PHP hidden in images, isolated command-line runs exercising exit codes 0/1/2, report permissions, quick mode, and callbacks for completed/partial/interrupted runs; counting and ETA; notification authentication, redirects, deadlines, full findings beyond the preview limit, omitted-match counts, evidence filtering, and failure handling; and quarantine selection, hash/size matching, symlinked folders, hard links, exact restore of owner/mode/timestamps, refusal to overwrite, purge confirmation, the action log, and refusal without an interactive terminal. Notification transport tests use a local HTTP receiver and do not contact external services.
 
 Older-runtime validation used packages verified against signed Ubuntu archive metadata in isolated chroots under WSL:
 
 | Ubuntu userspace | Python | Test result |
 | --- | --- | --- |
-| 18.04 | 3.6.9 | 72 passed; 1 skipped (AST grammar selection needs Python 3.8+) |
-| 20.04 | 3.8.10 | 73 passed |
+| 18.04 | 3.6.9 | 73 passed; 1 skipped (AST grammar selection needs Python 3.8+) |
+| 20.04 | 3.8.10 | 74 passed |
 
 Both also passed isolated `--help` and Bash/`/bin/sh` setup checks. Ubuntu's curl 7.58.0 and 7.68.0 accept the download options used here. This validates the older userspace and Python APIs; each server's RunCloud configuration, kernel and external HTTPS endpoint still need on-host validation.
 

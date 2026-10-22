@@ -1,12 +1,16 @@
 """Run the documented setup in temporary directories, with offline curl fixtures."""
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
+import shlex
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -23,7 +27,7 @@ class SetupTests(unittest.TestCase):
         self.bin.mkdir()
         self.fixtures = self.root / "fixtures"
         self.fixtures.mkdir()
-        content = b"# inert download fixture\n"
+        content = b'VERSION = "inert-download-fixture"\n'
         (self.fixtures / "runcloud-triage.py").write_bytes(content)
         self.checksum = self.fixtures / "runcloud-triage.py.sha256"
         self.checksum.write_text(hashlib.sha256(content).hexdigest() + "  runcloud-triage.py\n")
@@ -84,6 +88,67 @@ class SetupTests(unittest.TestCase):
                 result = self.run_command(shell, command)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse((self.root / "chmod-called").exists())
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "Background launch tests require Linux")
+class BackgroundTests(unittest.TestCase):
+    def test_background_run_survives_hangup_and_records_private_logs_and_exit_codes(self):
+        readme = README.read_text(encoding="utf-8").split("### Run in the background after SSH disconnects", 1)[1]
+        command = re.search(r"```bash\n(.*?)\n```", readme, re.S).group(1)
+        self.check_background_command(command)
+
+    def check_background_command(self, command, expected_args=None):
+        # A harmless Python fixture replaces the scanner; no host scan or callback runs.
+        with tempfile.TemporaryDirectory(prefix="triage-background-test-") as directory:
+            root = Path(directory)
+            scanner = root / "scanner.py"
+            scanner.write_text(
+                "import json, os, sys, time\n"
+                "assert sys.stdin.read() == ''\n"
+                "assert not sys.stdin.isatty() and not sys.stdout.isatty()\n"
+                "if 'FIXTURE_ARGS' in os.environ: assert sys.argv[1:] == json.loads(os.environ['FIXTURE_ARGS'])\n"
+                "print('fixture started', flush=True)\n"
+                "print('fixture stderr', file=sys.stderr, flush=True)\n"
+                "time.sleep(0.5)\n"
+                "print('fixture finished', flush=True)\n"
+                "sys.exit(int(os.environ['FIXTURE_EXIT']))\n"
+            )
+            command = command.replace("/root/runcloud-background.", str(root / "runcloud-background."))
+            command = command.replace("/usr/bin/python3", shlex.quote(sys.executable))
+            command = command.replace("/root/runcloud-triage/runcloud-triage.py", shlex.quote(str(scanner)))
+            environment = dict(os.environ)
+            if expected_args is not None:
+                environment['FIXTURE_ARGS'] = json.dumps(expected_args)
+            jobs = set()
+            for shell in ("/bin/bash", "/bin/sh"):
+                for exit_code in (0, 1, 2):
+                    with self.subTest(shell=shell, exit_code=exit_code):
+                        # Flattening simulates pasting a multiline command as one line.
+                        launch = subprocess.Popen([shell, "-c", " ".join(command.splitlines())],
+                                                  env=dict(environment, FIXTURE_EXIT=str(exit_code)),
+                                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                                  stderr=subprocess.PIPE, start_new_session=True)
+                        output, errors = launch.communicate(timeout=5)
+                        self.assertEqual(launch.returncode, 0, errors.decode())
+                        job = Path(re.search(rb"Background job: (.+)", output).group(1).decode())
+                        self.assertNotIn(job, jobs)
+                        jobs.add(job)
+                        log = job / "scan.log"
+                        deadline = time.monotonic() + 5
+                        while (not log.exists() or "fixture started" not in log.read_text()) and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        self.assertIn("fixture started", log.read_text())
+                        self.assertFalse((job / "exit-code").exists(), "Launcher must return before the scan finishes")
+                        # SSH/shell hangup reaches the job's process group; nohup must ignore it.
+                        os.killpg(launch.pid, signal.SIGHUP)
+                        while (not (job / "exit-code").exists() or not (job / "exit-code").read_text()) and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        self.assertEqual((job / "exit-code").read_text(), str(exit_code) + "\n")
+                        self.assertIn("fixture finished", log.read_text())
+                        self.assertIn("fixture stderr", log.read_text())
+                        self.assertEqual(stat.S_IMODE(job.stat().st_mode), 0o700)
+                        for name in ("scan.log", "pid", "exit-code"):
+                            self.assertEqual(stat.S_IMODE((job / name).stat().st_mode), 0o600)
 
 
 if __name__ == "__main__":
