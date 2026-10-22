@@ -182,11 +182,13 @@ class OptionTests(unittest.TestCase):
 
     def test_notification_options_validate_before_scanning(self):
         self.assertIsNone(triage.parse_options([]).notify_url)
+        self.assertFalse(triage.parse_options([]).notify_findings)
+        self.assertTrue(triage.parse_options(["--notify-url", "https://example.test/hook", "--notify-findings"]).notify_findings)
         self.assertEqual(triage.parse_options(["--notify-url", "https://example.test/hook"]).notify_timeout, 10)
         for options in (["--notify-url", "file:///etc/passwd"], ["--notify-url", "https://user:pass@example.test/hook"],
                         ["--notify-url", "https://example.test/hook#fragment"], ["--notify-url", "http://example.test:99999"],
                         ["--notify-url", "https://example.test/\r\nheader"], ["--notify-token-file", "/root/token"],
-                        ["--notify-timeout", "0"], ["--notify-timeout", "61"]):
+                        ["--notify-findings"], ["--notify-timeout", "0"], ["--notify-timeout", "61"]):
             with mock.patch.object(triage.sys, "stderr", io.StringIO()), self.assertRaises(SystemExit):
                 triage.parse_options(options)
 
@@ -272,6 +274,7 @@ class NotificationTests(unittest.TestCase):
 
     def test_payload_is_a_summary_without_paths_options_or_evidence(self):
         report = triage.Report("/root/report-id", self.args)
+        self.assertIsNone(report.notification_findings)
         report.counts.update(files=123, logs=4)
         report.severities.update(HIGH=2, REVIEW=3, INFO=4)
         report.gaps["file_read_error"] = 1
@@ -284,6 +287,7 @@ class NotificationTests(unittest.TestCase):
             self.assertEqual(payload["indicators"], {"HIGH": 2, "REVIEW": 3, "INFO": 4})
             self.assertEqual(payload["coverage_issues"], {"file_read_error": 1})
             self.assertEqual(payload["run_id"], "report-id")
+            self.assertNotIn("findings", payload)
             serialized = json.dumps(payload)
             for sensitive in ("private-url", "secret-evidence", "/private", "/root"):
                 self.assertNotIn(sensitive, serialized)
@@ -291,6 +295,68 @@ class NotificationTests(unittest.TestCase):
         self.assertIsNone(missing["run_id"])
         self.assertFalse(missing["report_finalized"])
         self.assertEqual(missing["status"], "incomplete")
+
+    def test_full_findings_post_exceeds_preview_limit_and_filters_evidence(self):
+        self.args.notify_findings = True
+        with tempfile.TemporaryDirectory() as directory:
+            report = triage.Report(directory, self.args)
+            try:
+                for index in range(75):
+                    report.finding("/home/user/webapps/site/tmp/file-{}.php".format(index), {
+                        "severity": "HIGH" if index == 0 else "REVIEW", "rule": "fixture_rule",
+                        "reason": "Inspect the fixture without executing it.", "line": index + 1,
+                        "byte_offset": index, "sha256": "a" * 64, "content_complete": True,
+                        "mtime_utc": "2026-10-22T12:00:00+00:00", "ctime_utc": "2026-10-22T12:00:00+00:00",
+                        "review_text": "private-file-content", "unexpected_field": "private-extra-evidence",
+                    })
+                log = {"severity": "INFO", "rule": "php_fatal_or_timeout", "reason": "Log indicator only.",
+                       "line_or_chunk": 12, "excerpt": "private-log-token", "excerpt_truncated": False}
+                report.finding("/var/log/php.log", log)
+                report.finding("/var/log/php.log", log, save=False)
+                report.finding("/var/log/php.log", log, save=False)
+                unusual_path = '/home/user/webapps/site/quoted-"-\n-\u00e9.php'
+                report.finding(unusual_path, {"severity": "REVIEW", "rule": "fixture_rule",
+                                             "sha256": None, "content_complete": False})
+                payload = triage.notification_payload(self.args, report, 0, 20, True, True, 1)
+                with mock.patch("builtins.print"):
+                    self.assertTrue(triage.send_notification(self.args, payload, "private-token"))
+            finally:
+                for handle in report.handles.values():
+                    handle.close()
+            saved = [json.loads(line) for line in (Path(directory) / "findings.jsonl").read_text().splitlines()]
+        path, headers, delivered = self.requests[0]
+        self.assertEqual(headers["Authorization"], "Bearer private-token")
+        self.assertEqual(delivered["findings_scope"], "saved_findings")
+        self.assertEqual(delivered["findings_count"], 77)
+        self.assertEqual(len(delivered["findings"]), len(saved))
+        self.assertEqual(delivered["findings_omitted"], 2)
+        self.assertEqual(sum(delivered["indicators"].values()), 79)
+        self.assertEqual(len(report.preview), 40)
+        first = delivered["findings"][0]
+        self.assertEqual(first["kind"], "file")
+        self.assertEqual(first["site"], "/home/user/webapps/site")
+        self.assertEqual(first["reason"], "Inspect the fixture without executing it.")
+        self.assertEqual(first["line"], 1)
+        self.assertEqual(first["sha256"], "a" * 64)
+        self.assertEqual(delivered["findings"][75]["kind"], "log")
+        self.assertEqual(delivered["findings"][75]["line_or_chunk"], 12)
+        self.assertEqual(delivered["findings"][-1]["path"], unusual_path)
+        self.assertIsNone(delivered["findings"][-1]["sha256"])
+        self.assertFalse(delivered["findings"][-1]["content_complete"])
+        serialized = json.dumps(delivered)
+        for sensitive in ("private-file-content", "private-extra-evidence", "private-log-token", "private-token", "private-url"):
+            self.assertNotIn(sensitive, serialized)
+        self.assertEqual(saved[75]["excerpt"], "private-log-token")
+
+    def test_requested_findings_on_initialization_failure_are_empty_not_a_clean_scan(self):
+        self.args.notify_findings = True
+        payload = triage.notification_payload(self.args, None, 0, 1, False, False, 2)
+        self.assertEqual(payload["findings"], [])
+        self.assertEqual(payload["findings_count"], 0)
+        self.assertEqual(payload["findings_omitted"], 0)
+        self.assertFalse(payload["scan_finished"])
+        self.assertFalse(payload["report_finalized"])
+        self.assertEqual(payload["status"], "incomplete")
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "Filesystem tests require Linux")
@@ -551,7 +617,7 @@ class LinuxFixtureTests(unittest.TestCase):
         self.assertEqual(quick.returncode, 0, quick.stdout.decode() + quick.stderr.decode())
         self.assertNotIn(b"Counting files:", quick.stdout)
         self.assertIn(b"Quick mode:", quick.stdout)
-        notify_args = ["--notify-url", "http://example.test/hook?private=url"]
+        notify_args = ["--notify-url", "http://example.test/hook?private=url", "--notify-findings"]
         notified_clean = subprocess.run([sys.executable, "-c", code, str(jail)] + notify_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(notified_clean.returncode, 0)
         (jail / "home/user/webapps/site/example.jpg").write_bytes(request_sample())
@@ -586,6 +652,15 @@ class LinuxFixtureTests(unittest.TestCase):
             self.assertEqual(callbacks[0]["status"], status)
             self.assertEqual(callbacks[0]["report_finalized"], finalized)
             self.assertEqual(callbacks[0]["exit_code"], result.returncode)
+            payload = callbacks[0]
+            self.assertEqual(payload["findings_count"], len(payload["findings"]))
+            self.assertEqual(payload["findings_omitted"], 0)
+            if result is notified_review:
+                self.assertTrue(any(row["rule"] == "request_to_execution" and row["kind"] == "file"
+                                    and row["path"] == "/home/user/webapps/site/example.jpg"
+                                    for row in payload["findings"]))
+            if result in (notified_clean, notified_init, notified_interrupted):
+                self.assertEqual(payload["findings"], [])
         reports = list((jail / "root").glob("runcloud-triage-*"))
         self.assertEqual(len(reports), 8)
         for report in reports:

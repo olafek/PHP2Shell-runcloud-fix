@@ -4,6 +4,7 @@
 Run with /usr/bin/python3 -I. Never imports or executes application code.
 A scan only writes to a newly created private report directory. See README.md.
 Optional --notify-url posts a small result summary to your own HTTP(S) endpoint.
+Add --notify-findings to include the full saved findings list without log excerpts.
 Files are moved only when a person chooses them at a terminal: after a scan, or
 later with --quarantine REPORT_DIR, --restore or --purge (no rescan needed).
 """
@@ -35,7 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 MIB = 1024 * 1024
 # Not named runcloud-triage-* so it is never mistaken for (or globbed with) a report folder.
 QUARANTINE_DIR = "/root/runcloud-quarantine"
@@ -250,6 +251,7 @@ class Report:
         self.gaps = collections.Counter()
         self.sites = collections.defaultdict(collections.Counter)
         self.preview = []
+        self.notification_findings = [] if args.notify_findings else None
         self.started = time.time()
         self.started_monotonic = time.monotonic()
         self.last_progress = None
@@ -287,6 +289,14 @@ class Report:
         self.sites[row["site"]][row["severity"]] += 1
         if save:
             self.emit("findings", row)
+            if self.notification_findings is not None:
+                # Explicit fields only: never upload log excerpts or arbitrary evidence.
+                finding = {key: row[key] for key in (
+                    "path", "site", "severity", "rule", "reason", "line", "byte_offset",
+                    "line_or_chunk", "sha256", "content_complete", "mtime_utc", "ctime_utc"
+                ) if key in row}
+                finding["kind"] = "log" if "excerpt" in row else "file"
+                self.notification_findings.append(finding)
         if save and row["severity"] != "INFO" and len(self.preview) < 40:
             self.preview.append({k: row[k] for k in ("severity", "rule", "path")})
 
@@ -812,6 +822,8 @@ def parser():
     p.add_argument("--no-precount", action="store_true", help="Start scanning sooner; omit file-count percentage and ETA")
     p.add_argument("--quick", action="store_true", help="Use smaller read/sample limits for a faster first pass; reduces coverage")
     p.add_argument("--notify-url", type=notification_url, help="POST a small JSON result summary to this HTTP(S) URL after the scan")
+    p.add_argument("--notify-findings", action="store_true",
+                   help="Include every saved finding's path, rule and review metadata in the JSON POST (requires --notify-url)")
     p.add_argument("--notify-token-file", help="Private root-owned file containing a bearer token for --notify-url")
     p.add_argument("--notify-timeout", type=notification_timeout, default=10, help="Notification deadline in seconds (1-60; default 10)")
     p.add_argument("--max-file-mib", type=bounded_int, help="Leading bytes per non-log file; default 16 MiB, or 1 with --quick")
@@ -835,6 +847,8 @@ def parse_options(argv=None):
     args = argument_parser.parse_args(argv)
     if args.notify_token_file and not args.notify_url:
         argument_parser.error("--notify-token-file requires --notify-url")
+    if args.notify_findings and not args.notify_url:
+        argument_parser.error("--notify-findings requires --notify-url")
     if (args.quarantine or args.restore or args.purge) and args.notify_url:
         argument_parser.error("--notify-url applies to scans, not to --quarantine/--restore/--purge")
     if any(inside(os.path.abspath(args.quarantine_dir), p) for p in ("/home", "/tmp", "/var/tmp", "/dev/shm")):
@@ -867,7 +881,7 @@ def read_notification_token(path):
 def notification_payload(args, report, started, elapsed, complete, finalized, exit_code):
     counts = report.counts if report is not None else collections.Counter()
     severities = report.severities if report is not None else collections.Counter()
-    return {
+    payload = {
         "schema_version": 1, "event": "runcloud-triage.finished", "scanner_version": VERSION,
         "run_id": report.out.name if report is not None else None,
         "hostname": socket.gethostname(), "started_utc": utc(started), "finished_utc": utc(time.time()),
@@ -881,6 +895,11 @@ def notification_payload(args, report, started, elapsed, complete, finalized, ex
         "quick_mode": args.quick,
         "limits": {name: getattr(args, name) for name in ("max_file_mib", "max_log_mib", "max_total_log_mib", "log_samples")},
     }
+    if args.notify_findings:
+        findings = report.notification_findings if report is not None else []
+        payload.update(findings=findings, findings_count=len(findings), findings_scope="saved_findings",
+                       findings_omitted=max(0, sum(severities.values()) - len(findings)))
+    return payload
 
 
 class NoNotificationRedirects(urllib.request.HTTPRedirectHandler):

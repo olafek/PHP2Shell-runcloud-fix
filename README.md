@@ -2,7 +2,7 @@
 
 A standalone, read-only triage script for **RunCloud on Ubuntu 18.04 and newer**, including servers running **PHP 7.4 and newer**. It runs as root, inspects sites throughout `/home`, and writes a private report for each server. The scan itself never changes files: flagged files are moved into a root-only quarantine only when you choose them at the terminal, and can be restored (see [step 6](#6-quarantine-restore-or-delete-flagged-files)).
 
-**It requires Python 3.6 or newer. It does not require, execute, upgrade, or modify PHP.** It uses only Python's standard library and does not install Python packages. By default it makes no network requests or uploads. Optional `--notify-url` sends a small JSON result summary to an endpoint you choose.
+**It requires Python 3.6 or newer. It does not require, execute, upgrade, or modify PHP.** It uses only Python's standard library and does not install Python packages. By default it makes no network requests or uploads. Optional `--notify-url` sends a small JSON result summary to an endpoint you choose; add `--notify-findings` to include every saved finding's path and review metadata.
 
 This is a first-pass investigation tool for the PHP vulnerabilities announced on 21 October 2026 and for common signs of persistent compromise. **It cannot certify that a server is clean, identify every attack, or prove that a finding was caused by PHP2Shell.** A successful attack may leave no files or retained logs. File timestamps alone cannot establish whether compromise happened before patching.
 
@@ -172,7 +172,7 @@ Use `--notify-url` to notify your own project when a run ends. This is an **HTTP
 /usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --notify-url 'https://your-project.example/api/triage-results'
 ```
 
-The callback contains the hostname, run ID, timing, scan outcome, file/log counts, severity totals, coverage-gap counts, and effective read limits. It does not send application file paths, log excerpts, findings, credentials, or report attachments. Use HTTPS for remote endpoints; HTTP is available for local/private testing.
+By default, the callback contains the hostname, run ID, timing, scan outcome, file/log counts, severity totals, coverage-gap counts, and effective read limits. This summary does not send application file paths, log excerpts, findings, credentials, or report attachments. Use HTTPS for remote endpoints; HTTP is available for local/private testing.
 
 For an authenticated endpoint, create a root-owned, mode `0600` or `0400` regular file containing one bearer token, for example `/root/runcloud-triage-notify.token` (the token step at the start of step 4 does this). Keep it outside scanned directories. Symlinks, empty tokens, internal whitespace, and files larger than 4096 bytes are rejected. A trailing newline is accepted.
 
@@ -188,7 +188,7 @@ An example payload for a completed scan with indicators to review:
 {
   "schema_version": 1,
   "event": "runcloud-triage.finished",
-  "scanner_version": "1.3.0",
+  "scanner_version": "1.4.0",
   "run_id": "runcloud-triage-web-01-20261022T120000Z-a1b2c3d4",
   "hostname": "web-01",
   "started_utc": "2026-10-22T12:00:00+00:00",
@@ -206,6 +206,41 @@ An example payload for a completed scan with indicators to review:
   "limits": {"max_file_mib": 16, "max_log_mib": 512, "max_total_log_mib": 8192, "log_samples": 200}
 }
 ```
+
+To include the full saved findings list in the same JSON POST, add `--notify-findings` to the scan command:
+
+```bash
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --notify-url 'https://your-project.example/api/triage-results' --notify-token-file /root/runcloud-triage-notify.token --notify-findings --notify-timeout 30
+```
+
+This adds the following fields to the summary payload (example with one finding):
+
+```json
+{
+  "findings_scope": "saved_findings",
+  "findings_count": 1,
+  "findings_omitted": 0,
+  "findings": [
+    {
+      "kind": "file",
+      "path": "/home/runcloud/webapps/phpmyadmin/tmp/twig/03/example.php",
+      "site": "/home/runcloud/webapps/phpmyadmin",
+      "severity": "REVIEW",
+      "rule": "php_in_writable_directory",
+      "reason": "PHP in an upload/temp directory; verify whether this is expected.",
+      "content_complete": true
+    }
+  ]
+}
+```
+
+- `findings` includes **every saved HIGH, REVIEW and INFO finding**, in scan order, rather than the first 40 shown in the summary. One file can have several entries for different rules. The quarantine menu groups files separately; JSON array indexes are not quarantine selection numbers.
+- Each entry includes its `path`, `site`, `severity`, `rule`, `reason`, and `kind` (`file` or `log`). Where recorded, it also includes `line`, `byte_offset`, `line_or_chunk`, `sha256`, `content_complete`, `mtime_utc`, and `ctime_utc`. A partial file read has `sha256: null`; full and prefix hashes with sizes remain available in the local `files.jsonl` inventory.
+- `findings_count` is the array length. `findings_omitted` counts detected matches absent from the array, normally repeated log matches beyond `--log-samples`. The existing `indicators` totals still count those matches. This option does not increase scan/read/sample limits. An incomplete scan can also send the findings saved so far; check `scan_finished`, `report_finalized`, and coverage gaps even if `findings_omitted` is zero.
+- Raw file contents, log excerpts, arbitrary evidence fields, and the notification token are excluded from the JSON body. Paths and site names are included, so use a trusted receiver and protect its stored results. Escape these values when displaying them in a web interface.
+- The list is retained in memory only when this option is enabled, and is sent in one POST without an additional findings cap. For large reports, account for memory use, the receiver/proxy request-body limit, and `--notify-timeout`. HTTP 413 or another delivery failure does not silently trim the list or change the local report or scan exit code.
+
+The callback runs **before the interactive quarantine prompt**. It reports scan findings, not subsequent quarantine actions, and cannot choose files or trigger quarantine remotely. A scan already running will keep its original notification behavior; use the updated script and flag on the next run.
 
 In your project, accept a POST with `Content-Type: application/json; charset=utf-8`, validate the bearer token if configured, store the result, and return a **2xx** response promptly. `hostname` and `run_id` identify the server and local report folder. The response body is ignored.
 
@@ -285,6 +320,10 @@ Missing inspection commands, byte/sample limits, unexpanded archives and externa
 3. Review unexpected PHP in uploads, recent changes, cron commands, systemd overrides and unfamiliar SSH keys.
 4. Correlate error spikes with `traffic.jsonl`, original access/error logs and off-host CDN/WAF logs. Normal access logs often lack request bodies and Content-Type. POST volume, OOM errors and 5xx responses are not proof of this exploit or of a successful attack. Logged IPs may be proxies; do not assume they identify an attacker.
 5. Review live processes and connections. These are a point-in-time snapshot and cannot show a connection that has already ended.
+
+For phpMyAdmin, `tmp/twig/...php` paths are consistent with its generated template cache, and `libraries/classes/Plugins/Transformations/TEMPLATE_ABSTRACT` is an upstream PHP source template without a `.php` extension. Vendor `README.md` files can contain PHP examples. Those are plausible explanations for `php_in_writable_directory` and `php_in_other_file_type`, not confirmations that a particular server's copies are safe. The writable-directory rule uses path names such as `tmp` and `uploads`; it is not a test of effective write permissions. [phpMyAdmin temporary-directory documentation](https://docs.phpmyadmin.net/en/master/config.html#cfg_TempDir), [upstream template example](https://github.com/phpmyadmin/phpmyadmin/blob/RELEASE_5_2_2/libraries/classes/Plugins/Transformations/TEMPLATE_ABSTRACT)
+
+Review each file's rules, reasons and available line numbers in `findings.jsonl`. Compare distributed files with a trusted copy of the **same installed release/dependency version**. Generated cache files need source review and comparison with the templates that produced them; their hashed names do not authenticate their contents. Prioritize unexpected executable code, unexplained changes and corroborating persistence or log evidence. Do not quarantine a file solely because it is listed: `h` selects all HIGH files, and HIGH is a review priority, not a confirmed malware verdict. Press Enter to defer quarantine while investigating.
 
 If you find credible compromise, preserve reports and original logs and isolate the affected workload as appropriate. Do not simply delete a flagged file and declare the server clean: quarantine (step 6) contains a file, it does not clean a server. Investigate the scope, restore/rebuild from trusted sources as warranted, and rotate affected credentials from a trusted machine. Plan application encryption-key changes carefully: blindly replacing a Laravel `APP_KEY` can make existing encrypted data unreadable.
 
@@ -394,7 +433,7 @@ python3 -m py_compile runcloud-triage.py
 
 Linux filesystem fixtures test symlink/FIFO handling, age-independent coverage, report generation, compressed logs, limits and read failures. Detection and timestamp tests can also run on Windows; Linux-specific tests are skipped there. Python 3.6 grammar is checked on interpreters that provide AST grammar selection. Testing on a newer interpreter does not substitute for an end-to-end trial on your oldest server image.
 
-Validation for this version: **66 tests passed on Linux with Python 3.10.12**, including isolated command-line runs exercising exit codes 0/1/2, report permissions, quick mode, and callbacks for completed/partial/interrupted runs; counting and ETA; notification authentication, redirects, deadlines, payload filtering, and failure handling; and quarantine selection, hash/size matching, symlinked folders, hard links, exact restore of owner/mode/timestamps, refusal to overwrite, purge confirmation, the action log, and refusal without an interactive terminal. Notification transport tests use a local HTTP receiver and do not contact external services. Python 3.6 syntax and the APIs used for older-Ubuntu compatibility were checked; an actual Ubuntu 18.04/Python 3.6 runtime was not available for execution here.
+Validation for this version: **68 tests passed on Ubuntu 22.04 (WSL) with Python 3.10.12**, including isolated command-line runs exercising exit codes 0/1/2, report permissions, quick mode, and callbacks for completed/partial/interrupted runs; counting and ETA; notification authentication, redirects, deadlines, full findings beyond the preview limit, omitted-match counts, evidence filtering, and failure handling; and quarantine selection, hash/size matching, symlinked folders, hard links, exact restore of owner/mode/timestamps, refusal to overwrite, purge confirmation, the action log, and refusal without an interactive terminal. Notification transport tests use a local HTTP receiver and do not contact external services. Python 3.6 syntax and the APIs used for older-Ubuntu compatibility were checked; an actual Ubuntu 18.04/Python 3.6 runtime was not available for execution here.
 
 ### Publishing updates
 
