@@ -36,7 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 MIB = 1024 * 1024
 # Not named runcloud-triage-* so it is never mistaken for (or globbed with) a report folder.
 QUARANTINE_DIR = "/root/runcloud-quarantine"
@@ -189,6 +189,45 @@ def readable_php_tag(data):
     return False
 
 
+def mask_php_comments(data):
+    """Mask confirmed PHP comments, preserving byte offsets and line numbers.
+
+    This is deliberately conservative, not a PHP parser. Quoted strings are
+    consumed intact so comment markers inside them cannot hide executable code.
+    At heredoc/nowdoc syntax we stop masking: ambiguous text remains detectable.
+    """
+    tokens = re.compile(rb"<\?(?:php\b|=)?|\?>|<<<|'(?:\\.|[^'\\])*'|"
+                        rb'"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`|'
+                        rb"/\*[\s\S]*?(?:\*/|\Z)|//[^\r\n]*(?:\r?\n|\Z)|\#(?!\[)[^\r\n]*(?:\r?\n|\Z)", re.I)
+    masked = bytearray(data)
+    in_php = False
+    position = 0
+    while position < len(data):
+        if not in_php:
+            opening = re.search(rb"<\?(?:php\b|=)?", data[position:], re.I)
+            if not opening:
+                break
+            position += opening.end()
+            in_php = True
+        match = tokens.search(data, position)
+        if not match:
+            break
+        token = match.group()
+        position = match.end()
+        if token == b"<<<":
+            break
+        if token == b"?>":
+            in_php = False
+        elif token.startswith((b"/*", b"//", b"#")):
+            # A close tag terminates a single-line PHP comment, even before LF.
+            end = match.end()
+            if not token.startswith(b"/*") and b"?>" in token:
+                end = match.start() + token.index(b"?>")
+                position = end
+            masked[match.start():end] = re.sub(rb"[^\r\n]", b" ", data[match.start():end])
+    return bytes(masked)
+
+
 def file_rules(path, data, persistence=False):
     """Heuristics, not proof of exploitation or attribution to either CVE."""
     name = Path(path).name.lower()
@@ -200,6 +239,8 @@ def file_rules(path, data, persistence=False):
     if has_php or php_extension or persistence:
         for severity, rule, pattern, reason in RULES:
             match = pattern.search(data)
+            if match and rule == "variable_request_callable":
+                match = pattern.search(mask_php_comments(data))
             if match:
                 results.append({"severity": severity, "rule": rule, "reason": reason,
                                 "line": data.count(b"\n", 0, match.start()) + 1,
@@ -211,7 +252,9 @@ def file_rules(path, data, persistence=False):
         if re.search(r"/(?:wp-content/uploads|uploads?|\.cache|tmp)/", lower):
             results.append({"severity": "REVIEW", "rule": "php_in_writable_directory",
                             "reason": "PHP in an upload/temp directory; verify whether this is expected."})
-        if "/storage/" in lower and not re.search(r"/storage/framework/(?:views|cache)/", lower):
+        # Linux paths are case-sensitive: Symfony's Session/Storage is not Laravel storage.
+        normalized = path.replace("\\", "/")
+        if "/storage/" in normalized and not re.search(r"/storage/framework/(?:views|cache)/", normalized):
             results.append({"severity": "REVIEW", "rule": "php_in_storage",
                             "reason": "PHP in application storage; inspect whether generated code or an unexpected file."})
     if name in CONFIG_NAMES or persistence:
@@ -277,6 +320,8 @@ class Report:
         self.completed_items = 0
         self.scan_started = None
         self.scan_complete = False
+        self.vendor_baseline = {}
+        self.vendor_checked = set()
 
     def emit(self, stream, row):
         if stream not in self.handles:
@@ -292,6 +337,8 @@ class Report:
         home = self.args.home.rstrip("/")
         if inside(path, home):
             parts = path[len(home):].strip("/").split("/")
+            if self.args.user_mode:
+                return home + "/" + parts[0]
             if len(parts) >= 3 and parts[1] == "webapps":
                 return home + "/" + "/".join(parts[:3])
             return home + "/" + parts[0] + "/[outside-webapps]"
@@ -307,7 +354,8 @@ class Report:
                 # Explicit fields only: never upload log excerpts or arbitrary evidence.
                 finding = {key: row[key] for key in (
                     "path", "site", "severity", "rule", "reason", "line", "byte_offset",
-                    "line_or_chunk", "sha256", "content_complete", "mtime_utc", "ctime_utc"
+                    "line_or_chunk", "sha256", "content_complete", "mtime_utc", "ctime_utc",
+                    "expected_sha256", "package", "version"
                 ) if key in row}
                 finding["kind"] = "log" if "excerpt" in row else "file"
                 self.notification_findings.append(finding)
@@ -369,6 +417,8 @@ class Report:
                 options[name] = "[configured]"
         summary = {
             "scanner_version": VERSION, "hostname": socket.gethostname(),
+            "scan_scope": "user" if self.args.user_mode else "system",
+            "effective_uid": os.geteuid() if hasattr(os, "geteuid") else None,
             "started_utc": utc(self.started), "finished_utc": utc(time.time()),
             "scan_finished": complete, "counts": dict(self.counts),
             "indicators": dict(self.severities), "coverage_issues": dict(self.gaps),
@@ -380,6 +430,7 @@ class Report:
         lines = ["RUNCLOUD INCIDENT TRIAGE " + VERSION, "Host: " + summary["hostname"],
                  "Report: " + str(self.out), "Started UTC: " + summary["started_utc"],
                  "Finished UTC: " + summary["finished_utc"],
+                 "Scan scope: " + summary["scan_scope"],
                  "Scan finished: " + str(complete), "Result: " + summary["verdict"],
                  summary["warning"], "", "Indicators: " + json.dumps(dict(self.severities)),
                  "Counts: " + json.dumps(dict(self.counts)),
@@ -392,7 +443,9 @@ class Report:
                   "All retained logs were considered regardless of --since, subject to reported limits.",
                   "--since limits recent-file inventory and journal snapshot only, not file signatures.",
                   "mtime/ctime are clues, not creation times or proof of when exploitation happened.",
-                  "No baseline comparison, database audit, memory capture, or complete container inspection was performed.",
+                  ("Vendor baseline comparison covers only supplied files; inspect vendor-integrity.jsonl and coverage.jsonl."
+                   if self.args.vendor_baseline else "No trusted vendor baseline was supplied; dependency integrity is unverified."),
+                  "No database audit, memory capture, or complete container inspection was performed.",
                   "Symlinks are inventoried but not followed. Archives are not unpacked.",
                   "Log bodies/Content-Type may be absent; a POST or a 5xx is not proof of attack.",
                   "A live scan is not atomic. Reads may update access times; command execution creates normal audit records.",
@@ -513,6 +566,20 @@ def scan_file(path, report, persistence=False, config=False):
         if path.lower().endswith(ARCHIVE_EXT):
             report.gap(path, "archive_not_unpacked", "Raw bytes scanned; embedded/compressed files not inspected")
         items, php = file_rules(path, data, persistence or config)
+        expected = report.vendor_baseline.get(path)
+        if expected is not None:
+            report.vendor_checked.add(path)
+            integrity = dict(expected, path=path, actual_sha256=row["sha256"],
+                             status="unverified" if partial else "match" if digest == expected["sha256"] else "mismatch")
+            report.emit("vendor-integrity", integrity)
+            report.counts["vendor_" + integrity["status"]] += 1
+            if partial:
+                report.gap(path, "vendor_baseline_unverified", "Full file content is needed for comparison")
+            elif digest != expected["sha256"]:
+                items.append({"severity": "HIGH", "rule": "vendor_content_mismatch",
+                              "reason": "File differs from the supplied trusted release baseline; verify local patches and source. This is not proof of malware.",
+                              "expected_sha256": expected["sha256"], "package": expected.get("package"),
+                              "version": expected.get("version")})
         row["php_candidate"] = php
         if php:
             report.counts["php_candidates"] += 1
@@ -743,6 +810,13 @@ def scan_targets(report, record=True):
                 continue
             seen.add(path)
             yield path, st, "log" if LOG_NAME.search(Path(path).name) else "file"
+    if args.user_mode:
+        for root in args.log_root:
+            for path, st in walk_files(root, report, record=record):
+                if path not in seen and (LOG_NAME.search(Path(path).name) or root == path):
+                    seen.add(path)
+                    yield path, st, "log"
+        return
     # Scan temp locations for dropped scripts/binaries without executing them.
     for root in existing_paths(["/tmp", "/var/tmp", "/dev/shm"]):
         for path, st in walk_files(root, report, record=record):
@@ -787,7 +861,11 @@ def scan_targets(report, record=True):
 
 
 def run_scan(report):
-    system_snapshot(report)
+    if report.args.user_mode:
+        report.gap(report.args.home, "user_scope_only",
+                   "Only the selected user files and explicit extra/log roots are inspected. System snapshots, global logs, persistence and other accounts are not checked.")
+    else:
+        system_snapshot(report)
     if not report.args.no_precount:
         report.counting = True
         report.total_items = 0
@@ -818,6 +896,10 @@ def run_scan(report):
                                       "reason": "Executable file in a temporary directory; verify its owner and purpose."})
         report.completed_items += 1
         report.progress(phase)
+    for path in sorted(set(report.vendor_baseline) - report.vendor_checked):
+        report.gap(path, "vendor_baseline_unverified", "Not compared: missing, unreadable, skipped, or outside the selected file scope")
+        report.emit("vendor-integrity", dict(report.vendor_baseline[path], path=path, status="unverified", actual_sha256=None))
+        report.counts["vendor_unverified"] += 1
     report.scan_complete = True
     if report.total_items is not None:
         report.total_items = report.completed_items
@@ -826,19 +908,20 @@ def run_scan(report):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--home", default="/home", help="Scan all regular files below this directory")
+    p.add_argument("--home", help="Scan all regular files below this directory (root: /home; user: account home/webapps)")
     p.add_argument("--extra-root", action="append", default=[], help="Additional real directory/file to inspect; repeatable")
     p.add_argument("--log-root", action="append", default=[], help="Additional log directory or log file; repeatable")
     p.add_argument("--since", type=parse_time, default=dt.datetime.now(UTC) - dt.timedelta(days=14),
                    help="Recent-file/journal start; signatures and retained logs are NOT date-filtered. Default: 14 days ago")
     p.add_argument("--patched-at", type=parse_time, help="Optional UTC patch time; annotates mtime only, not compromise time")
-    p.add_argument("--output-parent", default="/root", help="Existing root-owned private directory (default /root)")
+    p.add_argument("--output-parent", help="Existing directory owned by you (root: private /root; user: account home, not writable by others)")
+    p.add_argument("--vendor-baseline", help="Optional private JSON manifest of trusted vendor release hashes; no downloads or application code execution")
     p.add_argument("--no-precount", action="store_true", help="Start scanning sooner; omit file-count percentage and ETA")
     p.add_argument("--quick", action="store_true", help="Use smaller read/sample limits for a faster first pass; reduces coverage")
     p.add_argument("--notify-url", type=notification_url, help="POST a small JSON result summary to this HTTP(S) URL after the scan")
     p.add_argument("--notify-findings", action="store_true",
                    help="Include every saved finding's path, rule and review metadata in the JSON POST (requires --notify-url)")
-    p.add_argument("--notify-token-file", help="Private root-owned file containing a bearer token for --notify-url")
+    p.add_argument("--notify-token-file", help="Private file owned by the invoking user containing a bearer token for --notify-url")
     p.add_argument("--notify-timeout", type=notification_timeout, default=10, help="Notification deadline in seconds (1-60; default 10)")
     p.add_argument("--max-file-mib", type=bounded_int, help="Leading bytes per non-log file; default 16 MiB, or 1 with --quick")
     p.add_argument("--max-log-mib", type=bounded_int, help="Decompressed bytes per log; default 512 MiB, or 32 with --quick")
@@ -859,6 +942,15 @@ def parser():
 def parse_options(argv=None):
     argument_parser = parser()
     args = argument_parser.parse_args(argv)
+    args.user_mode = hasattr(os, "geteuid") and os.geteuid() != 0
+    if args.user_mode:
+        import pwd
+        account_home = pwd.getpwuid(os.geteuid()).pw_dir
+        args.home = args.home or os.path.join(account_home, "webapps")
+        args.output_parent = args.output_parent or account_home
+    else:
+        args.home = args.home or "/home"
+        args.output_parent = args.output_parent or "/root"
     if args.notify_token_file and not args.notify_url:
         argument_parser.error("--notify-token-file requires --notify-url")
     if args.notify_findings and not args.notify_url:
@@ -881,8 +973,8 @@ def read_notification_token(path):
     handle, _ = open_regular(os.path.abspath(path))
     with handle:
         info = os.fstat(handle.fileno())
-        if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o077:
-            raise ValueError("Notification token file must be root-owned and private (mode 0600 or 0400)")
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError("Notification token file must be owned by the invoking user and private (mode 0600 or 0400)")
         data = handle.read(4097)
     if len(data) > 4096:
         raise ValueError("Notification token file exceeds 4096 bytes")
@@ -890,6 +982,39 @@ def read_notification_token(path):
     if not token or any(ord(char) < 33 or ord(char) > 126 for char in token):
         raise ValueError("Notification token must contain one nonempty ASCII token without whitespace")
     return token
+
+
+def read_vendor_baseline(path):
+    """A supplied manifest is a reference, never authority to widen the scan or skip rules."""
+    if not path:
+        return {}
+    handle, _ = open_regular(os.path.abspath(path))
+    with handle:
+        info = os.fstat(handle.fileno())
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError("Vendor baseline must be owned by the invoking user and private (0600 or 0400)")
+        raw = handle.read(8 * MIB + 1)
+    if len(raw) > 8 * MIB:
+        raise ValueError("Vendor baseline exceeds 8 MiB")
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict) or data.get("schema_version") != 1 or not isinstance(data.get("files"), dict):
+        raise ValueError("Vendor baseline requires schema_version 1 and a files object")
+    files = data["files"]
+    if not files or len(files) > 50000:
+        raise ValueError("Vendor baseline requires 1 to 50000 file entries")
+    for name, entry in files.items():
+        if (not name.startswith("/") or os.path.normpath(name) != name or "/vendor/" not in name
+                or any(ord(char) < 32 for char in name) or "\\" in name):
+            raise ValueError("Baseline paths must be normalized absolute Linux paths inside vendor/")
+        if (not isinstance(entry, dict) or not isinstance(entry.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])):
+            raise ValueError("Each baseline entry requires a lowercase SHA256 hash")
+        for label in ("package", "version"):
+            if label in entry and (not isinstance(entry[label], str) or len(entry[label]) > 200
+                                   or any(ord(char) < 32 for char in entry[label])):
+                raise ValueError("Baseline package/version must be short strings without control characters")
+    return {name: {key: entry[key] for key in ("sha256", "package", "version") if key in entry}
+            for name, entry in files.items()}
 
 
 def notification_payload(args, report, started, elapsed, complete, finalized, exit_code):
@@ -900,6 +1025,8 @@ def notification_payload(args, report, started, elapsed, complete, finalized, ex
         "run_id": report.out.name if report is not None else None,
         "hostname": socket.gethostname(), "started_utc": utc(started), "finished_utc": utc(time.time()),
         "duration_seconds": round(max(0, elapsed), 2),
+        "scan_scope": "user" if args.user_mode else "system",
+        "effective_uid": os.geteuid() if hasattr(os, "geteuid") else None,
         "status": {0: "completed", 1: "review_required", 2: "incomplete"}[exit_code],
         "exit_code": exit_code, "scan_finished": complete, "report_finalized": finalized,
         "verdict": "REVIEW_REQUIRED" if severities["HIGH"] or severities["REVIEW"] else "NO_MATCHING_INDICATORS",
@@ -1348,6 +1475,8 @@ def offer_purge(quarantine_dir, ask=input):
 
 def offer_after_scan(report_dir, args, ask=input):
     """After the summary and any notification: offer quarantine at a terminal, and always print the later command."""
+    if args.user_mode:
+        return
     try:
         candidates = quarantine_candidates(report_dir)
     except (OSError, ValueError):
@@ -1363,6 +1492,9 @@ def offer_after_scan(report_dir, args, ask=input):
 
 
 def run_quarantine_action(args, ask=input):
+    if os.geteuid() != 0:
+        print("Quarantine, restore and purge require root. User-account scans are read-only.", file=sys.stderr)
+        return 2
     if not interactive_terminal():
         print("--quarantine, --restore and --purge change files only after you choose them: run them in an interactive terminal.",
               file=sys.stderr)
@@ -1378,15 +1510,15 @@ def run_quarantine_action(args, ask=input):
 
 def main():
     args = parse_options()
-    if not sys.platform.startswith("linux") or os.geteuid() != 0:
-        print("Run this on the Ubuntu server as root using /usr/bin/python3 -I.", file=sys.stderr)
+    if not sys.platform.startswith("linux"):
+        print("Run this on the Ubuntu server using /usr/bin/python3 -I.", file=sys.stderr)
         return 2
     if args.quarantine or args.restore or args.purge:
         return run_quarantine_action(args)
     try:
         notify_token = read_notification_token(args.notify_token_file)
     except (OSError, ValueError):
-        print("Cannot read notification token: use a private, root-owned regular file with one ASCII token (up to 4096 bytes), without symlinks.", file=sys.stderr)
+        print("Cannot read notification token: use a private regular file owned by the invoking user with one ASCII token (up to 4096 bytes), without symlinks.", file=sys.stderr)
         return 2
     started, started_monotonic = time.time(), time.monotonic()
     os.umask(0o077)
@@ -1400,12 +1532,15 @@ def main():
     report = None
     complete, finalized, exit_code = False, False, 2
     try:
+        baseline = read_vendor_baseline(args.vendor_baseline)
         dfd = open_directory(args.output_parent)
         try:
             st = os.fstat(dfd)
-            if st.st_uid != 0 or stat.S_IMODE(st.st_mode) & 0o077:
-                raise ValueError("--output-parent must be root-owned with mode 0700 (or stricter)")
-            if any(inside(args.output_parent, p) for p in [args.home, "/tmp", "/var/tmp", "/dev/shm"] + args.extra_root + args.log_root):
+            forbidden_mode = 0o022 if args.user_mode else 0o077
+            if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) & forbidden_mode:
+                raise ValueError("--output-parent must be owned by you and " +
+                                 ("not writable by group/others" if args.user_mode else "mode 0700 (or stricter)"))
+            if not args.user_mode and any(inside(args.output_parent, p) for p in [args.home, "/tmp", "/var/tmp", "/dev/shm"] + args.extra_root + args.log_root):
                 raise ValueError("Output parent must be outside scanned trees")
             host = re.sub(r"[^A-Za-z0-9_.-]", "_", socket.gethostname())[:80]
             folder = "runcloud-triage-" + host + "-" + dt.datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + os.urandom(4).hex()
@@ -1414,6 +1549,7 @@ def main():
         finally:
             os.close(dfd)
         report = Report(out, args)
+        report.vendor_baseline = baseline
         try:
             script, _ = open_regular(os.path.abspath(__file__))
             with script:
@@ -1422,6 +1558,8 @@ def main():
         except OSError as exc:
             report.gap(__file__, "scanner_hash_unavailable", exc)
         print("Writing private report to: " + out, flush=True)
+        if args.user_mode:
+            print("User-account scan: " + args.home + ". System-wide checks and root-only quarantine are unavailable.", flush=True)
         print("Progress measures scan attempts. HIGH/REVIEW need investigation; INFO provides context. Matches are not confirmed infections.", flush=True)
         if args.quick:
             print("Quick mode: reduced read limits; check coverage.jsonl for content not inspected.", flush=True)

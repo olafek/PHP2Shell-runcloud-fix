@@ -14,7 +14,7 @@ The download example uses `master` to get the latest published scanner. That bra
 
 ## 2. Log in and check requirements
 
-Log in as root, or become root with `sudo -i`:
+For a server-wide scan, log in as root, or become root with `sudo -i`. For an account-only scan without sudo, use [Run as a RunCloud user](#run-as-a-runcloud-user-without-root) instead.
 
 ```bash
 ssh root@YOUR-SERVER
@@ -129,10 +129,18 @@ For a callback, add your existing `--notify-url`, `--notify-token-file`, `--noti
 
 The launch command returns immediately and prints a unique folder such as `/root/runcloud-background.a1B2c3`. That folder is mode `0700`; its log, launcher PID and eventual exit-code file are mode `0600`. Save the printed path. The first lines of `scan.log` show the separate private report directory, or an error if the scanner could not start. A successful launch alone does not mean the scan succeeded.
 
-After reconnecting, use the printed `tail -f` command to watch progress. **Ctrl+C stops watching the log; the background scan keeps running.** If you lost the path, list the run folders with `ls -dt /root/runcloud-background.*`. Replace `a1B2c3` below with your run's folder:
+**Watch progress and ETA after reconnecting:** log in as root and paste this command. It prints the last 30 log lines, then follows new progress updates from the most recently updated background-run folder. It prints the selected folder so you can confirm which run you are watching:
 
 ```bash
-tail -f /root/runcloud-background.a1B2c3/scan.log
+RUN_DIR=$(ls -1dt /root/runcloud-background.*/ 2>/dev/null | head -n 1); if [ -n "$RUN_DIR" ]; then printf 'Watching %s\n' "$RUN_DIR"; tail -n 30 -f "$RUN_DIR/scan.log"; else printf 'No background scan folders found.\n'; fi;
+```
+
+The log includes percentage, estimated time remaining (`ETA`), elapsed time, file/log phase and match counts. Progress normally updates about every 15 seconds during active processing; it can pause during an individual operation. ETA becomes available after the initial counting phase and some items have been scanned, and can change as the workload changes. Runs started with `--no-precount` show counts and elapsed time without an ETA.
+
+**Ctrl+C stops watching the log; the background scan keeps running.** If several runs exist, an older run finishing can update its folder's timestamp. To watch a specific run, use the folder printed by its launch command instead. Replace `a1B2c3` below with that run's folder:
+
+```bash
+tail -n 30 -f /root/runcloud-background.a1B2c3/scan.log
 ```
 
 Check the saved result after it finishes:
@@ -144,6 +152,67 @@ cat /root/runcloud-background.a1B2c3/exit-code
 `0` means no matching HIGH/REVIEW indicators, `1` means review is required, and `2` means incomplete/failed; review the report and coverage gaps in every case. Other codes can indicate a launch failure. If `exit-code` is absent, the job may still be running or may have been interrupted; check its log and `ps -p "$(cat /root/runcloud-background.a1B2c3/pid)" -o pid,etime,args`. The PID identifies the waiting launcher and can be reused after it exits.
 
 The configured completion callback still runs. Background scans have no interactive terminal and cannot prompt to quarantine files. Review the report after completion, then use `--quarantine REPORT_DIR` in a new interactive SSH session if needed. Do not start another scan just because the original SSH session closed.
+
+### Run as a RunCloud user without root
+
+Scanner **1.6.0+** also runs as an ordinary RunCloud SSH user. Use the same script; no sudo or separate edition is needed. Log in as the account that owns the websites. Check `/usr/bin/python3 --version` (3.6+) and `command -v curl`; ask the server administrator to install missing prerequisites.
+
+Download into your home directory, outside `webapps`:
+
+```bash
+(
+    umask 077 &&
+    install -d -m 0700 "$HOME/runcloud-triage" &&
+    cd "$HOME/runcloud-triage" &&
+    TRIAGE_REF='master' &&
+    TRIAGE_RAW_BASE="https://raw.githubusercontent.com/olafek/PHP2Shell-runcloud-fix/$TRIAGE_REF" &&
+    curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py" -o runcloud-triage.py &&
+    curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py.sha256" -o runcloud-triage.py.sha256 &&
+    sha256sum --check runcloud-triage.py.sha256 &&
+    chmod 0600 runcloud-triage.py runcloud-triage.py.sha256 &&
+    grep -m1 '^VERSION' runcloud-triage.py
+);
+```
+
+Continue only after the checksum says `OK` and the version is at least 1.6.0. Run in SSH:
+
+```bash
+/usr/bin/python3 -I "$HOME/runcloud-triage/runcloud-triage.py"
+```
+
+The default scan root is **the invoking account's home directory from the system account database, plus `/webapps`**. Reports go in that account's home, inside a new `0700` folder with `0600` files. Your existing home must belong to you and must not be writable by group or others; `0755` is acceptable. `--home /actual/path` selects another real directory if your layout differs. `--output-parent /private/path` selects an existing report parent owned by you; keep reports outside website directories. The active report is excluded if you explicitly scan a parent containing it; older reports are not automatically excluded.
+
+This scans accessible website files, including `vendor/`, and application logs. `--extra-root` and `--log-root` can add explicit accessible paths. It **does not inspect other accounts by default, global temporary directories, system persistence, global logs or system/process snapshots**. Every user scan records `scan_scope: "user"`, its effective UID and a `user_scope_only` coverage limitation. Permission failures are reported; exit `0` only describes the selected scope. Root is still needed for server-wide investigation and all quarantine/restore/purge actions. The scanner never quarantines automatically.
+
+Optional callback token, owned by this user:
+
+```bash
+bash -c 'read -r -s -p "Server Scan Token: " NOTIFY_TOKEN && printf "\n" && install -m 600 /dev/null "$HOME/runcloud-triage-notify.token" && printf "%s\n" "$NOTIFY_TOKEN" > "$HOME/runcloud-triage-notify.token"';
+```
+
+Add `--notify-url 'https://your-site.example/...' --notify-token-file "$HOME/runcloud-triage-notify.token" --notify-findings --notify-timeout 30` to the scan command if required.
+
+Or run **one scan in the background**, surviving an SSH disconnect:
+
+```bash
+(
+    umask 077 &&
+    RUN_DIR=$(mktemp -d "$HOME/runcloud-background.XXXXXX") &&
+    {
+        nohup /bin/sh -c 'run_dir=$1; shift; "$@"; result=$?; printf "%s\n" "$result" > "$run_dir/exit-code"; exit "$result"' sh "$RUN_DIR" /usr/bin/python3 -u -I "$HOME/runcloud-triage/runcloud-triage.py" < /dev/null > "$RUN_DIR/scan.log" 2>&1 &
+        printf '%s\n' "$!" > "$RUN_DIR/pid";
+        printf 'Background job: %s\nWatch: tail -f %s/scan.log\nExit code: cat %s/exit-code\n' "$RUN_DIR" "$RUN_DIR" "$RUN_DIR";
+    }
+);
+```
+
+Put callback/scan options after the script path and before `< /dev/null`. Reconnect as the **same user** and watch percentage, ETA and elapsed time:
+
+```bash
+RUN_DIR=$(ls -1dt "$HOME"/runcloud-background.*/ 2>/dev/null | head -n 1); if [ -n "$RUN_DIR" ]; then printf 'Watching %s\n' "$RUN_DIR"; tail -n 30 -f "$RUN_DIR/scan.log"; else printf 'No background scan folders found.\n'; fi;
+```
+
+Ctrl+C stops watching, not the scan. The latest-folder caveat, saved exit code and progress behaviour are the same as in the root background instructions above. This does not repeat or survive a reboot.
 
 ### Reading the progress bar
 
@@ -368,6 +437,36 @@ For phpMyAdmin, `tmp/twig/...php` paths are consistent with its generated templa
 Review each file's rules, reasons and available line numbers in `findings.jsonl`. Compare distributed files with a trusted copy of the **same installed release/dependency version**. Generated cache files need source review and comparison with the templates that produced them; their hashed names do not authenticate their contents. Prioritize unexpected executable code, unexplained changes and corroborating persistence or log evidence. Do not quarantine a file solely because it is listed: `h` selects all HIGH files, and HIGH is a review priority, not a confirmed malware verdict. Press Enter to defer quarantine while investigating.
 
 If you find credible compromise, preserve reports and original logs and isolate the affected workload as appropriate. Do not simply delete a flagged file and declare the server clean: quarantine (step 6) contains a file, it does not clean a server. Investigate the scope, restore/rebuild from trusted sources as warranted, and rotate affected credentials from a trusted machine. Plan application encryption-key changes carefully: blindly replacing a Laravel `APP_KEY` can make existing encrypted data unreadable.
+
+### Verify dependency files against a trusted release
+
+`vendor/` remains in the scan. Since 1.6.0, the request-callable rule ignores confirmed PHP comments, including Symfony's `$_SERVER['HTTP_HOST'] (deprecated ...)` documentation. The case-sensitive `Session/Storage` directory is also distinguished from Laravel's lowercase `storage/`. These changes do not exempt Symfony files from other checks or from executable request-callable detection. No heuristic match automatically quarantines a file.
+
+For stronger evidence, supply **hashes obtained independently from the exact official dependency release** with `--vendor-baseline /private/vendor-baseline.json`. Check the package version and commit in your trusted deployment's `composer.lock`; get that release on a clean machine. Do not build the baseline from the suspected server's current files or assume its package metadata is trustworthy. A local `composer install` is not an integrity check for an existing `vendor/` tree. See [Composer's reproducible dependency instructions](https://getcomposer.org/doc/01-basic-usage.md#installing-with-composer-lock) and [its notes on existing vendor contents](https://getcomposer.org/doc/articles/caching.md).
+
+Example manifest format (replace the placeholder with the trusted file's 64-character lowercase SHA256, and use the actual server path/package/version):
+
+```json
+{
+  "schema_version": 1,
+  "files": {
+    "/home/ACCOUNT/webapps/APP/vendor/symfony/http-foundation/Session/Storage/NativeSessionStorage.php": {
+      "sha256": "REPLACE_WITH_TRUSTED_FILE_SHA256",
+      "package": "symfony/http-foundation",
+      "version": "REPLACE_WITH_EXACT_RELEASE"
+    }
+  }
+}
+```
+
+Use `sha256sum /path/to/trusted/release/Session/Storage/NativeSessionStorage.php` on the clean machine to obtain the hash. Transfer the manifest securely, make it owned by the account running the scanner and mode `0600` or `0400`, and keep it outside website directories. It may contain up to 50,000 file entries within 8 MiB. Paths must be absolute, normalized Linux paths under `vendor/`; the manifest does not expand the scan's selected roots.
+
+```bash
+# Root example; user mode uses the same option with paths in that user's home.
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --vendor-baseline /root/vendor-baseline.json
+```
+
+`vendor-integrity.jsonl` records `match`, `mismatch` or `unverified` for each supplied file. Full-content mismatches produce a **HIGH `vendor_content_mismatch` review indicator**, including the expected hash and release labels. Legitimate local patches can also differ. Matching a supplied hash does not suppress any detection rule or establish that the whole dependency is safe. Missing, unreadable, out-of-scope and partially read files remain unverified and produce coverage gaps; increase the read limit if necessary. Files absent from the manifest get the ordinary heuristic scan but no release-integrity claim. Without a manifest, dependency integrity remains unverified. The scanner downloads no dependency code and never runs PHP, Composer, plugins or application scripts.
 
 ## 6. Quarantine, restore or delete flagged files
 

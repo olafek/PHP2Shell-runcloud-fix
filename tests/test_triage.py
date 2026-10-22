@@ -48,7 +48,36 @@ class DetectionTests(unittest.TestCase):
         self.assertIn("encoded_execution", self.rules("/home/a/a.php", sample(b"eval(" + b"gzinflate(base64_decode('AAAA')));")))
 
     def test_request_callable(self):
-        self.assertIn("variable_request_callable", self.rules("/home/a/a.php", sample(b"$_REQUEST['f']" + b"('x');")))
+        # Bytes are inspected only; PHP fixtures are never executed.
+        self.assertIn("variable_request_callable", self.rules("/home/a/a.php", b"<" + b"?php $_REQUEST['f']" + b"('x');"))
+
+    def test_symfony_session_documentation_is_not_a_callable_or_storage(self):
+        path = "/home/a/vendor/symfony/http-foundation/Session/Storage/NativeSessionStorage.php"
+        code = (b"<" + b"?php\n/**\n * trans_sid_hosts, $_SERVER['HTTP_HOST'] "
+                b"(deprecated since Symfony 7.2, to be removed in Symfony 8.0)\n */\n"
+                b"$sessionId = $_COOKIE[session_name()] ?? null;\n")
+        self.assertEqual(self.rules(path, code), set())
+        injected = code + b"$_REQUEST['function']" + b"('argument');"
+        finding = triage.file_rules(path, injected)[0][0]
+        self.assertEqual(finding["rule"], "variable_request_callable")
+        self.assertEqual(finding["severity"], "HIGH")
+        self.assertEqual(finding["line"], 6)
+        self.assertEqual(finding["byte_offset"], len(code))
+        self.assertIn("php_in_storage", self.rules("/home/a/storage/unexpected.php", code))
+
+    def test_callable_comments_preserve_offsets_and_do_not_hide_later_code(self):
+        callable_text = b"$_GET['f']" + b"();"
+        prefix = b"<" + b"?php\n"
+        for comment in (b"/* " + callable_text + b" */\n", b"// " + callable_text + b"\n",
+                        b"# " + callable_text + b"\n"):
+            self.assertNotIn("variable_request_callable", self.rules("/home/a/a.php", prefix + comment))
+            code = prefix + comment + callable_text
+            finding = triage.file_rules("/home/a/a.php", code)[0][0]
+            self.assertEqual(finding["byte_offset"], len(prefix + comment))
+            self.assertEqual(finding["line"], 3)
+        for text in (b"$a = '/*'; ", b'$a = "//"; ', b"$a = `echo '#'`; ",
+                     b"// close ?><?php ", b"#[Attribute]\n", b"$text = <<<TXT\n/*\nTXT;\n"):
+            self.assertIn("variable_request_callable", self.rules("/home/a/a.php", prefix + text + callable_text))
 
     def test_disguised_php_upload(self):
         result = self.rules("/home/a/webapps/b/wp-content/uploads/image.jpg", b"\xff\xd8\xff" + request_sample())
@@ -608,6 +637,127 @@ class LinuxFixtureTests(unittest.TestCase):
             token.write_text(content)
             with self.assertRaises(ValueError):
                 triage.read_notification_token(str(token))
+
+    def test_trusted_vendor_baseline_comparison_never_suppresses_rules(self):
+        path = self.write("a/vendor/pkg/file.php", request_sample())
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        self.report.vendor_baseline = {str(path): {"sha256": digest, "package": "vendor/pkg", "version": "1.0.0"}}
+        triage.scan_file(str(path), self.report)
+        self.assertEqual(self.rows("vendor-integrity")[0]["status"], "match")
+        self.assertIn("request_to_execution", {row["rule"] for row in self.rows("findings")})
+        path.write_bytes(b"changed dependency without suspicious PHP")
+        triage.scan_file(str(path), self.report)
+        mismatch = [row for row in self.rows("findings") if row["rule"] == "vendor_content_mismatch"][0]
+        self.assertEqual(mismatch["severity"], "HIGH")
+        self.assertEqual(mismatch["expected_sha256"], digest)
+        self.assertEqual(mismatch["version"], "1.0.0")
+        self.assertEqual(self.rows("vendor-integrity")[-1]["status"], "mismatch")
+
+    def test_vendor_baseline_partial_missing_and_outside_scope_are_unverified(self):
+        path = self.write("a/vendor/pkg/large.php", b"x" * (triage.MIB + 1))
+        missing = str(self.home / "a/vendor/pkg/missing.php")
+        outside = str(self.root / "outside/vendor/other.php")
+        self.report.vendor_baseline = {name: {"sha256": "0" * 64} for name in (str(path), missing, outside)}
+        self.args.user_mode = True
+        self.args.max_file_mib = 1
+        with mock.patch.object(triage, "system_snapshot", side_effect=AssertionError("System scan in user mode")), contextlib.redirect_stdout(io.StringIO()):
+            triage.run_scan(self.report)
+        self.assertEqual(self.report.gaps["vendor_baseline_unverified"], 3)
+        self.assertEqual(self.report.counts["vendor_unverified"], 3)
+        self.assertEqual({row["status"] for row in self.rows("vendor-integrity")}, {"unverified"})
+        self.assertNotIn("vendor_content_mismatch", {row["rule"] for row in self.rows("findings")})
+
+    def test_vendor_baseline_validation_and_link_safety(self):
+        baseline = self.root / "baseline.json"
+        valid = {"schema_version": 1, "files": {"/home/u/webapps/app/vendor/pkg/a.php": {"sha256": "a" * 64}}}
+        baseline.write_text(json.dumps(valid))
+        baseline.chmod(0o600)
+        self.assertEqual(triage.read_vendor_baseline(str(baseline)), valid["files"])
+        baseline.chmod(0o644)
+        with self.assertRaises(ValueError):
+            triage.read_vendor_baseline(str(baseline))
+        baseline.chmod(0o600)
+        link = self.root / "baseline-link"
+        link.symlink_to(baseline)
+        with self.assertRaises(OSError):
+            triage.read_vendor_baseline(str(link))
+        invalid = [[], {"files": {}}, {"schema_version": 1, "files": {}},
+                   {"schema_version": 1, "files": {"/home/u/vendor/../bad": {"sha256": "a" * 64}}},
+                   {"schema_version": 1, "files": {"/home/u/vendor/a": {"sha256": "not a hash"}}}]
+        for data in invalid:
+            baseline.write_text(json.dumps(data))
+            with self.assertRaises(ValueError):
+                triage.read_vendor_baseline(str(baseline))
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "Dropping privileges in chroot requires root")
+    def test_user_account_cli_scope_permissions_notifications_and_root_actions(self):
+        jail = self.root / "user-jail"
+        for relative in ("home/account/webapps/site/vendor/pkg", "home/other/webapps/site", "etc", "root", "tmp"):
+            (jail / relative).mkdir(parents=True, exist_ok=True)
+        for folder, directories, _ in os.walk(str(jail)):
+            os.chmod(folder, 0o755)
+        (jail / "etc/passwd").write_text("account:x:1001:1001::/home/account:/bin/sh\n")
+        (jail / "runcloud-triage.py").write_bytes(SCRIPT.read_bytes())
+        (jail / "runcloud-triage.py").chmod(0o644)
+        target = jail / "home/account/webapps/site/vendor/pkg/file.php"
+        target.write_bytes(b"<" + b"?php /** $_SERVER['HTTP_HOST'] (deprecated) */")
+        untouched = jail / "home/other/webapps/site/other.php"
+        untouched.write_bytes(request_sample())
+        (jail / "tmp/system-only.php").write_bytes(request_sample())
+        token = jail / "home/account/notify.token"
+        token.write_text("fixture-token")
+        token.chmod(0o600)
+        for folder, _, files in os.walk(str(jail / "home/account")):
+            os.chown(folder, 1001, 1001)
+            for name in files:
+                os.chown(os.path.join(folder, name), 1001, 1001)
+        code = (
+            "import os,sys,pwd,importlib.util,_strptime,encodings.ascii; pwd.getpwuid(os.geteuid()); "
+            "s=importlib.util.spec_from_file_location('triage',sys.argv[1]+'/runcloud-triage.py'); "
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+            "m.send_notification=lambda args,payload,token=None: print('CALLBACK '+m.json.dumps(payload)) or True; "
+            "os.chroot(sys.argv[1]); os.chdir('/'); m.__file__='/runcloud-triage.py'; "
+            "os.setgroups([]); os.setgid(1001); os.setuid(1001); "
+            "sys.argv=['runcloud-triage.py']+sys.argv[2:]; sys.exit(m.main())"
+        )
+        def run(options):
+            return subprocess.run([sys.executable, "-c", code, str(jail)] + options,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        options = ["--notify-url", "https://example.test/hook", "--notify-token-file", "/home/account/notify.token", "--notify-findings"]
+        clean = run(options)
+        self.assertEqual(clean.returncode, 0, clean.stdout.decode() + clean.stderr.decode())
+        self.assertIn(b"User-account scan", clean.stdout)
+        self.assertNotIn(b"--quarantine", clean.stdout)
+        payload = json.loads(next(line[9:] for line in clean.stdout.decode().splitlines() if line.startswith("CALLBACK ")))
+        self.assertEqual(payload["scan_scope"], "user")
+        self.assertEqual(payload["effective_uid"], 1001)
+        self.assertEqual(payload["coverage_issues"], {"user_scope_only": 1})
+        self.assertEqual(payload["counts"], {"files": 1, "logs": 0})
+        self.assertEqual(payload["findings"], [])
+        target.write_bytes(request_sample())
+        review = run(options)
+        self.assertEqual(review.returncode, 1, review.stdout.decode() + review.stderr.decode())
+        self.assertNotIn(b"--quarantine", review.stdout)
+        target.chmod(0)
+        self.assertEqual(run([]).returncode, 2)
+        target.chmod(0o644)
+        for action in (["--quarantine", "/home/account/report"], ["--restore"], ["--purge"]):
+            result = run(action)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(b"require root", result.stderr)
+        self.assertEqual(run(["--output-parent", "/tmp"]).returncode, 2)
+        (jail / "home/account").chmod(0o777)
+        self.assertEqual(run([]).returncode, 2)
+        (jail / "home/account").chmod(0o755)
+        self.assertEqual(untouched.read_bytes(), request_sample())
+        for report in (jail / "home/account").glob("runcloud-triage-*"):
+            self.assertEqual(report.stat().st_uid, 1001)
+            self.assertEqual(stat.S_IMODE(report.stat().st_mode), 0o700)
+            self.assertFalse(list(report.glob("snapshot-*")))
+            self.assertEqual(json.loads((report / "summary.jsonl").read_text())["scan_scope"], "user")
+            for artifact in report.iterdir():
+                self.assertEqual(artifact.stat().st_uid, 1001)
+                self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
 
     @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "Isolated chroot CLI test requires root")
     def test_full_cli_in_isolated_filesystem(self):
