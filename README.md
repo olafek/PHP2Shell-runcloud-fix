@@ -6,34 +6,11 @@ A standalone, read-only triage script for **RunCloud on Ubuntu 18.04 and newer**
 
 This is a first-pass investigation tool for the PHP vulnerabilities announced on 21 October 2026 and for common signs of persistent compromise. **It cannot certify that a server is clean, identify every attack, or prove that a finding was caused by PHP2Shell.** A successful attack may leave no files or retained logs. File timestamps alone cannot establish whether compromise happened before patching.
 
-## 1. Publish the script
+## 1. Get the scanner from GitHub
 
-Upload these files to your GitHub repository:
+The public repository is [olafek/PHP2Shell-runcloud-fix](https://github.com/olafek/PHP2Shell-runcloud-fix). The steps below use `curl` inside your server's SSH session to download the scanner and its checksum. No Git installation, repository clone, or GitHub login is needed.
 
-- `runcloud-triage.py`
-- `runcloud-triage.py.sha256`
-- `README.md`
-
-When publishing with Git, include `.gitattributes` too so the scanner keeps consistent LF line endings across workstations.
-
-Tests can also be published; they are not required on the servers. Do not publish server reports, logs, credentials, or the contents of `/root`.
-
-The commands below use a **placeholder** GitHub address. Replace `YOUR-ORG`, `YOUR-REPO`, and `YOUR-COMMIT` with your values. Use the same commit on all servers so you know which scanner version each ran. A branch name such as `main` also works, but its contents can change.
-
-Whenever the script changes, regenerate its checksum before publishing:
-
-```bash
-sha256sum runcloud-triage.py > runcloud-triage.py.sha256
-```
-
-On Windows PowerShell, the equivalent is:
-
-```powershell
-$digest = (Get-FileHash -Algorithm SHA256 -LiteralPath ./runcloud-triage.py).Hash.ToLower()
-"$digest  runcloud-triage.py" | Set-Content -Encoding ascii ./runcloud-triage.py.sha256
-```
-
-Preserve the script's bytes when uploading; line-ending changes change its checksum. The published checksum detects transfer/file mismatches. A checksum downloaded from the same repository is **not independent authentication** of that repository.
+The download example pins commit `8d0c97adf7ff00d0a511a34c8d2c35f85f5e2ffe` so every server receives the same scanner version. To download the latest published version instead, set `TRIAGE_REF='master'` in step 3; that branch can change between runs.
 
 ## 2. Log in and check requirements
 
@@ -60,7 +37,7 @@ apt-get update
 apt-get install --no-install-recommends python3 curl ca-certificates
 ```
 
-## 3. Download and install
+## 3. Download inside the SSH session
 
 Run these commands as root. Keep the scanner outside website directories.
 
@@ -69,7 +46,8 @@ install -d -o root -g root -m 0700 /root/runcloud-triage
 cd /root/runcloud-triage
 umask 077
 
-TRIAGE_RAW_BASE='https://raw.githubusercontent.com/YOUR-ORG/YOUR-REPO/YOUR-COMMIT'
+TRIAGE_REF='8d0c97adf7ff00d0a511a34c8d2c35f85f5e2ffe'
+TRIAGE_RAW_BASE="https://raw.githubusercontent.com/olafek/PHP2Shell-runcloud-fix/$TRIAGE_REF"
 
 curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
   "$TRIAGE_RAW_BASE/runcloud-triage.py" -o runcloud-triage.py
@@ -82,6 +60,8 @@ less runcloud-triage.py
 ```
 
 **Continue only if both downloads succeeded and the checksum says `OK`.** Download and inspect the file; do not pipe the remote script into a root shell. No executable bit, service installation, cron job, pip package, or PHP extension is required.
+
+The checksum detects transfer/file mismatches. A checksum downloaded from the same repository is **not independent authentication** of that repository.
 
 ## 4. Run it
 
@@ -262,3 +242,22 @@ python3 -m py_compile runcloud-triage.py
 Linux filesystem fixtures test symlink/FIFO handling, age-independent coverage, report generation, compressed logs, limits and read failures. Detection and timestamp tests can also run on Windows; Linux-specific tests are skipped there. Python 3.6 grammar is checked on interpreters that provide AST grammar selection. Testing on a newer interpreter does not substitute for an end-to-end trial on your oldest server image.
 
 Validation for this version: **24 tests passed on Linux with Python 3.10.12**, including an isolated full command-line run exercising exit codes 0/1/2 and report permissions, plus output and timeout limits. Python 3.6 syntax and the APIs used for older-Ubuntu compatibility were checked; an actual Ubuntu 18.04/Python 3.6 runtime was not available for execution here.
+
+### Publishing updates
+
+Keep `runcloud-triage.py`, `runcloud-triage.py.sha256`, `README.md`, and `.gitattributes` in the repository. Tests can also be published; they are not required on the servers. Do not publish server reports, logs, credentials, or the contents of `/root`.
+
+Whenever the script changes, regenerate its checksum before publishing:
+
+```bash
+sha256sum runcloud-triage.py > runcloud-triage.py.sha256
+```
+
+On Windows PowerShell, the equivalent is:
+
+```powershell
+$digest = (Get-FileHash -Algorithm SHA256 -LiteralPath ./runcloud-triage.py).Hash.ToLower()
+"$digest  runcloud-triage.py" | Set-Content -Encoding ascii ./runcloud-triage.py.sha256
+```
+
+Preserve the script's bytes when uploading; line-ending changes change its checksum. `.gitattributes` keeps consistent LF line endings across workstations. After a new scanner commit is published, update the pinned `TRIAGE_REF` and matching version description above to that commit when it should become the documented default.
