@@ -1,6 +1,6 @@
 # RunCloud incident triage
 
-A standalone, read-only triage script for **RunCloud on Ubuntu 18.04 and newer**, including servers running **PHP 7.4 and newer**. It runs as root, inspects sites throughout `/home`, and writes a private report for each server.
+A standalone, read-only triage script for **RunCloud on Ubuntu 18.04 and newer**, including servers running **PHP 7.4 and newer**. It runs as root, inspects sites throughout `/home`, and writes a private report for each server. The scan itself never changes files: flagged files are moved into a root-only quarantine only when you choose them at the terminal, and can be restored (see [step 6](#6-quarantine-restore-or-delete-flagged-files)).
 
 **It requires Python 3.6 or newer. It does not require, execute, upgrade, or modify PHP.** It uses only Python's standard library and does not install Python packages. By default it makes no network requests or uploads. Optional `--notify-url` sends a small JSON result summary to an endpoint you choose.
 
@@ -188,7 +188,7 @@ An example payload for a completed scan with indicators to review:
 {
   "schema_version": 1,
   "event": "runcloud-triage.finished",
-  "scanner_version": "1.2.0",
+  "scanner_version": "1.3.0",
   "run_id": "runcloud-triage-web-01-20261022T120000Z-a1b2c3d4",
   "hostname": "web-01",
   "started_utc": "2026-10-22T12:00:00+00:00",
@@ -286,9 +286,43 @@ Missing inspection commands, byte/sample limits, unexpanded archives and externa
 4. Correlate error spikes with `traffic.jsonl`, original access/error logs and off-host CDN/WAF logs. Normal access logs often lack request bodies and Content-Type. POST volume, OOM errors and 5xx responses are not proof of this exploit or of a successful attack. Logged IPs may be proxies; do not assume they identify an attacker.
 5. Review live processes and connections. These are a point-in-time snapshot and cannot show a connection that has already ended.
 
-If you find credible compromise, preserve reports and original logs and isolate the affected workload as appropriate. Do not simply delete a flagged file and declare the server clean. Investigate the scope, restore/rebuild from trusted sources as warranted, and rotate affected credentials from a trusted machine. Plan application encryption-key changes carefully: blindly replacing a Laravel `APP_KEY` can make existing encrypted data unreadable.
+If you find credible compromise, preserve reports and original logs and isolate the affected workload as appropriate. Do not simply delete a flagged file and declare the server clean: quarantine (step 6) contains a file, it does not clean a server. Investigate the scope, restore/rebuild from trusted sources as warranted, and rotate affected credentials from a trusted machine. Plan application encryption-key changes carefully: blindly replacing a Laravel `APP_KEY` can make existing encrypted data unreadable.
 
-## 6. Coverage and larger/custom servers
+## 6. Quarantine, restore or delete flagged files
+
+When a scan finishes in an interactive SSH terminal, after the summary and any notification, it lists every file with a HIGH or REVIEW finding (log evidence is not listed) and asks which to quarantine:
+
+```text
+   1. HIGH   /home/runcloud/webapps/app/public/x.php  [request_to_execution]
+   2. REVIEW /home/runcloud/webapps/app/wp-content/uploads/y.php  [php_in_writable_directory]
+Quarantine which? Numbers (e.g. 1 3-5), h = all HIGH, a = all, Enter = none:
+```
+
+Then answer `y` to confirm. Enter, `n`, Ctrl+C or a closed session change nothing. Redirected, piped or scheduled runs never ask; like every run with flagged files, they print the command to use later. The scan's exit code is the same either way.
+
+If the SSH session closed, or you want to decide later, use the report folder the scan printed. Nothing is scanned again:
+
+```bash
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --quarantine /root/runcloud-triage-SERVER-20261022T120000Z-a1b2c3d4
+```
+
+To put quarantined files back, or to delete quarantined copies for good:
+
+```bash
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --restore
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --purge
+```
+
+- **Only the file the scan read is moved.** It must still have the SHA-256 in the report or, for a file larger than the read limit, the same leading-bytes hash and size. Changed, missing or replaced files are skipped and listed as `SKIP`; scan again to review them.
+- **Links are never followed.** Every folder on the way is opened without following symlinks, and only the recorded path is touched. If the file has other hard links, the message says so: those names still point to the same content (find them with `find / -xdev -inum INODE`, using the inode from `files.jsonl`).
+- **Each file becomes one quarantine item**: `/root/runcloud-quarantine/<id>/content` (root-only, mode `0600`, never executable or web-served) plus `item.json` with the original path, owner, group, mode, timestamps, size, SHA-256, findings and report run ID. Later scans do not read this folder. `--quarantine-dir DIR` selects another root-owned `0700` folder outside `/home` and the temp directories; pass the same option to `--restore` and `--purge`.
+- **A site that loads a quarantined file may show errors** until you restore it or deploy a clean copy.
+- **`--restore`** checks the quarantined copy's hash, then writes it back with the original owner, group, mode and timestamps. It never overwrites: if something now exists at that path, or its folder is gone, the item stays in quarantine.
+- **`--purge`** permanently deletes the chosen quarantined copies after you type `DELETE`.
+- Every quarantine, restore and purge is appended to `/root/runcloud-quarantine/actions.jsonl`.
+- These commands run only as root in an interactive terminal. Exit codes: `0` when every chosen file succeeded or nothing was chosen, `1` when any was skipped, `2` for an unusable report or quarantine folder, or no terminal.
+
+## 7. Coverage and larger/custom servers
 
 The scanner walks **all regular files under `/home`**, not just `/home/runcloud` or one selected site. It groups conventional `/home/USER/webapps/APP` paths by app, and keeps nonstandard paths in an `outside-webapps` scope. It does not exclude `vendor`, `node_modules`, caches, uploads, hidden files or old releases.
 
@@ -314,7 +348,7 @@ No database audit, memory capture, rootkit detection, independent file-baseline 
 
 The script writes only its new report directory. It does not alter website content, settings, users, services or jobs, delete/quarantine files, or restart workers. As with other live triage, directory/file reads can affect access times, commands generate normal audit records, and concurrent changes mean this is not an atomic forensic image. It requests no-atime file reads where supported and reports fallback counts.
 
-## 7. Retrieve and retain reports
+## 8. Retrieve and retain reports
 
 From your trusted workstation, copy the report directory printed by the run:
 
@@ -360,7 +394,7 @@ python3 -m py_compile runcloud-triage.py
 
 Linux filesystem fixtures test symlink/FIFO handling, age-independent coverage, report generation, compressed logs, limits and read failures. Detection and timestamp tests can also run on Windows; Linux-specific tests are skipped there. Python 3.6 grammar is checked on interpreters that provide AST grammar selection. Testing on a newer interpreter does not substitute for an end-to-end trial on your oldest server image.
 
-Validation for this version: **45 tests passed on Linux with Python 3.10.12**, including isolated command-line runs exercising exit codes 0/1/2, report permissions, quick mode, and callbacks for completed/partial/interrupted runs; counting and ETA; and notification authentication, redirects, deadlines, payload filtering, and failure handling. Notification transport tests use a local HTTP receiver and do not contact external services. Python 3.6 syntax and the APIs used for older-Ubuntu compatibility were checked; an actual Ubuntu 18.04/Python 3.6 runtime was not available for execution here.
+Validation for this version: **66 tests passed on Linux with Python 3.10.12**, including isolated command-line runs exercising exit codes 0/1/2, report permissions, quick mode, and callbacks for completed/partial/interrupted runs; counting and ETA; notification authentication, redirects, deadlines, payload filtering, and failure handling; and quarantine selection, hash/size matching, symlinked folders, hard links, exact restore of owner/mode/timestamps, refusal to overwrite, purge confirmation, the action log, and refusal without an interactive terminal. Notification transport tests use a local HTTP receiver and do not contact external services. Python 3.6 syntax and the APIs used for older-Ubuntu compatibility were checked; an actual Ubuntu 18.04/Python 3.6 runtime was not available for execution here.
 
 ### Publishing updates
 

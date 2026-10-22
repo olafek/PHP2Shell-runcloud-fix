@@ -2,14 +2,16 @@
 """Read-only incident triage for Ubuntu 18.04+/RunCloud. Python 3.6+, standard library.
 
 Run with /usr/bin/python3 -I. Never imports or executes application code.
-Only writes to a newly created private report directory. See README.md.
+A scan only writes to a newly created private report directory. See README.md.
 Optional --notify-url posts a small result summary to your own HTTP(S) endpoint.
+Files are moved only when a person chooses them at a terminal: after a scan, or
+later with --quarantine REPORT_DIR, --restore or --purge (no rescan needed).
 """
 
 import argparse
 import bz2
 import collections
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import datetime as dt
 import errno
 import gzip
@@ -21,6 +23,7 @@ import os
 from pathlib import Path
 import re
 import selectors
+import shlex
 import shutil
 import signal
 import socket
@@ -32,8 +35,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 MIB = 1024 * 1024
+# Not named runcloud-triage-* so it is never mistaken for (or globbed with) a report folder.
+QUARANTINE_DIR = "/root/runcloud-quarantine"
+QUARANTINE_ITEM = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{8}")
+SEVERITY_ORDER = {"HIGH": 0, "REVIEW": 1}
 UTC = dt.timezone.utc
 PHP_EXT = re.compile(r"\.(?:php\d*|phtml|pht|phar|inc)(?:\.|$)", re.I)
 LOG_NAME = re.compile(r"(?:\.log(?:[.\-].*)?$|^(?:syslog|messages|kern\.log)(?:\.\d+)?(?:\.gz)?$)", re.I)
@@ -811,6 +818,15 @@ def parser():
     p.add_argument("--max-log-mib", type=bounded_int, help="Decompressed bytes per log; default 512 MiB, or 32 with --quick")
     p.add_argument("--max-total-log-mib", type=bounded_int, help="Total decompressed log budget; default 8192 MiB, or 512 with --quick")
     p.add_argument("--log-samples", type=bounded_int, help="Saved excerpts per log; default 200, or 50 with --quick; counting continues")
+    actions = p.add_mutually_exclusive_group()
+    actions.add_argument("--quarantine", metavar="REPORT_DIR",
+                         help="No scan: choose HIGH/REVIEW files from a previous report and move them into the quarantine")
+    actions.add_argument("--restore", action="store_true",
+                         help="No scan: choose quarantined files and put them back exactly as they were")
+    actions.add_argument("--purge", action="store_true",
+                         help="No scan: choose quarantined files and permanently delete them")
+    p.add_argument("--quarantine-dir", default=QUARANTINE_DIR,
+                   help="Root-only quarantine folder outside scanned trees (default " + QUARANTINE_DIR + ")")
     return p
 
 
@@ -819,6 +835,10 @@ def parse_options(argv=None):
     args = argument_parser.parse_args(argv)
     if args.notify_token_file and not args.notify_url:
         argument_parser.error("--notify-token-file requires --notify-url")
+    if (args.quarantine or args.restore or args.purge) and args.notify_url:
+        argument_parser.error("--notify-url applies to scans, not to --quarantine/--restore/--purge")
+    if any(inside(os.path.abspath(args.quarantine_dir), p) for p in ("/home", "/tmp", "/var/tmp", "/dev/shm")):
+        argument_parser.error("--quarantine-dir must be outside scanned trees")
     limits = {"max_file_mib": (16, 1), "max_log_mib": (512, 32),
               "max_total_log_mib": (8192, 512), "log_samples": (200, 50)}
     for name, values in limits.items():
@@ -918,11 +938,418 @@ def send_notification(args, payload, token=None):
     return False
 
 
+# Quarantine is the only code that changes files outside the report, and it runs only
+# after a person picks files at a terminal. Items are <quarantine>/<id>/{content,item.json};
+# actions.jsonl is an append-only log of every quarantine, restore and purge.
+
+class FileChanged(Exception):
+    pass
+
+
+def interactive_terminal():
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def private_directory(path, create=False):
+    """Descriptor for a directory owned by the running (root) user with no group/other access."""
+    path = os.path.abspath(path)
+    if create:
+        parent, name = os.path.split(path)
+        dfd = open_directory(parent)
+        try:
+            os.mkdir(name, 0o700, dir_fd=dfd)
+        except FileExistsError:
+            pass
+        finally:
+            os.close(dfd)
+    fd = open_directory(path)
+    st = os.fstat(fd)
+    if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) & 0o077:
+        os.close(fd)
+        raise ValueError(path + " must be owned by root with mode 0700 (or stricter)")
+    return fd
+
+
+def open_private_file(dir_fd, name):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise ValueError(name + " is not a regular file")
+    return fd
+
+
+def report_rows(dir_fd, name):
+    """Rows of one JSONL report artifact; an absent artifact has no rows."""
+    try:
+        fd = open_private_file(dir_fd, name)
+    except FileNotFoundError:
+        return
+    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                yield json.loads(line)
+
+
+def write_private_json(dir_fd, name, row):
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dir_fd)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=True, indent=2) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def log_action(quarantine_fd, action, item):
+    fd = os.open("actions.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
+                 dir_fd=quarantine_fd)
+    with os.fdopen(fd, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"utc": utc(time.time()), "action": action, "item": item["id"],
+                                 "original_path": item["original_path"], "sha256": item["sha256"],
+                                 "run_id": item.get("run_id")}, ensure_ascii=True) + "\n")
+
+
+def remove_item(quarantine_fd, item_id):
+    item_fd = os.open(item_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=quarantine_fd)
+    try:
+        for name in os.listdir(item_fd):
+            os.unlink(name, dir_fd=item_fd)
+    finally:
+        os.close(item_fd)
+    os.rmdir(item_id, dir_fd=quarantine_fd)
+
+
+def quarantine_candidates(report_dir):
+    """HIGH/REVIEW file findings of a finished report: one entry per file, HIGH first."""
+    dfd = private_directory(report_dir)
+    try:
+        flagged = collections.OrderedDict()
+        for row in report_rows(dfd, "findings.jsonl"):
+            # Log evidence (rows with an excerpt) points at a log, not at a file to contain.
+            if row.get("severity") not in SEVERITY_ORDER or "excerpt" in row or not isinstance(row.get("path"), str):
+                continue
+            entry = flagged.setdefault(row["path"], {"path": row["path"], "severity": row["severity"], "rules": []})
+            if SEVERITY_ORDER[row["severity"]] < SEVERITY_ORDER[entry["severity"]]:
+                entry["severity"] = row["severity"]
+            if row.get("rule") not in entry["rules"]:
+                entry["rules"].append(row.get("rule"))
+        if flagged:
+            # files.jsonl holds what the scan read: full hash, or prefix hash plus size for large files.
+            for row in report_rows(dfd, "files.jsonl"):
+                if row.get("path") in flagged:
+                    flagged[row["path"]]["scanned"] = {name: row.get(name) for name in
+                                                       ("sha256", "prefix_sha256", "bytes_read", "size")}
+    finally:
+        os.close(dfd)
+    run_id = os.path.basename(os.path.abspath(report_dir))
+    for entry in flagged.values():
+        entry["run_id"] = run_id
+    return sorted(flagged.values(), key=lambda entry: (SEVERITY_ORDER[entry["severity"]], entry["path"]))
+
+
+def copy_into_item(source_fd, item_fd, prefix_bytes):
+    out = os.open("content", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=item_fd)
+    digest, prefix, copied = hashlib.sha256(), hashlib.sha256(), 0
+    with os.fdopen(out, "wb") as handle:
+        for chunk in iter(lambda: os.read(source_fd, MIB), b""):
+            digest.update(chunk)
+            if copied < prefix_bytes:
+                prefix.update(chunk[:prefix_bytes - copied])
+            copied += len(chunk)
+            handle.write(chunk)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return digest.hexdigest(), prefix.hexdigest(), copied
+
+
+def quarantine_file(candidate, quarantine_dir, report_dir=None):
+    """Move one flagged file into the quarantine if it is still the file the scan read.
+
+    Returns (moved, message). Raises ValueError if the quarantine folder is not private.
+    """
+    path = candidate["path"]
+    scanned = candidate.get("scanned") or {}
+    full, prefix = scanned.get("sha256"), scanned.get("prefix_sha256")
+    if not (full or prefix):
+        return False, path + ": not quarantined, the report has no content hash to confirm it is the same file"
+    changed = path + ": not quarantined, it changed since the scan (review it and scan again)"
+    parent, name = os.path.split(path)
+    with ExitStack() as stack:
+        qfd = private_directory(quarantine_dir, create=True)
+        stack.callback(os.close, qfd)
+        try:
+            # Every ancestor is opened without following links, then the file itself.
+            dfd = open_directory(parent)
+            stack.callback(os.close, dfd)
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+            stack.callback(os.close, fd)
+        except FileNotFoundError:
+            return False, path + ": not quarantined, it no longer exists"
+        except OSError as exc:
+            return False, path + ": not quarantined, it cannot be opened without following links (" + (exc.strerror or str(exc)) + ")"
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return False, path + ": not quarantined, it is no longer a regular file"
+        if not full and st.st_size != scanned.get("size"):
+            return False, changed
+        item_id = dt.datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + os.urandom(4).hex()
+        os.mkdir(item_id, 0o700, dir_fd=qfd)
+        try:
+            item_fd = os.open(item_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=qfd)
+            try:
+                digest, prefix_digest, size = copy_into_item(fd, item_fd, scanned.get("bytes_read") or 0)
+                if (digest != full) if full else (prefix_digest != prefix or size != scanned.get("size")):
+                    raise FileChanged()
+                record = {"schema_version": 1, "id": item_id, "original_path": path, "uid": st.st_uid, "gid": st.st_gid,
+                          "mode": oct(stat.S_IMODE(st.st_mode)), "atime_ns": st.st_atime_ns, "mtime_ns": st.st_mtime_ns,
+                          "size": size, "sha256": digest, "hard_links": st.st_nlink, "severity": candidate.get("severity"),
+                          "rules": candidate.get("rules", []), "run_id": candidate.get("run_id"),
+                          "quarantined_utc": utc(time.time()), "scanner_version": VERSION}
+                write_private_json(item_fd, "item.json", record)
+                os.fsync(item_fd)
+            finally:
+                os.close(item_fd)
+            # Unlink only the same inode that was copied; a replacement since then is left alone.
+            now = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+                raise FileChanged()
+            os.unlink(name, dir_fd=dfd)
+        except FileChanged:
+            remove_item(qfd, item_id)
+            return False, changed
+        except BaseException:
+            try:
+                remove_item(qfd, item_id)
+            except OSError:
+                pass
+            raise
+        log_action(qfd, "quarantine", record)
+    message = path + ": quarantined as " + item_id
+    if st.st_nlink > 1:
+        others = st.st_nlink - 1
+        message += f" (it has {others} other hard link{'s' if others != 1 else ''} that still point to the same content)"
+    return True, message
+
+
+def quarantined_items(quarantine_dir):
+    """Items in the quarantine, oldest first; damaged entries are reported and skipped."""
+    try:
+        qfd = private_directory(quarantine_dir)
+    except FileNotFoundError:
+        return []
+    items = []
+    try:
+        for name in sorted(os.listdir(qfd)):
+            if not QUARANTINE_ITEM.fullmatch(name):
+                continue
+            try:
+                item_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=qfd)
+                try:
+                    with os.fdopen(open_private_file(item_fd, "item.json"), "r", encoding="utf-8") as handle:
+                        record = json.load(handle)
+                finally:
+                    os.close(item_fd)
+                items.append(dict(record, id=name))
+            except (OSError, ValueError) as exc:
+                print("Skipping damaged quarantine entry " + name + ": " + str(exc), file=sys.stderr)
+    finally:
+        os.close(qfd)
+    return sorted(items, key=lambda item: (item.get("quarantined_utc", ""), item.get("original_path", "")))
+
+
+def restore_item(item, quarantine_dir):
+    """Put a quarantined file back with its owner, mode and times; never overwrite."""
+    path = item["original_path"]
+    parent, name = os.path.split(path)
+    with ExitStack() as stack:
+        qfd = private_directory(quarantine_dir)
+        stack.callback(os.close, qfd)
+        item_fd = os.open(item["id"], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=qfd)
+        stack.callback(os.close, item_fd)
+        source = open_private_file(item_fd, "content")
+        stack.callback(os.close, source)
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: os.read(source, MIB), b""):
+            digest.update(chunk)
+        if digest.hexdigest() != item["sha256"]:
+            return False, path + ": not restored, the quarantined copy does not match its recorded hash"
+        os.lseek(source, 0, os.SEEK_SET)
+        try:
+            dfd = open_directory(parent)
+        except OSError as exc:
+            return False, path + ": not restored, its folder is missing or reached through a link (" + (exc.strerror or str(exc)) + ")"
+        stack.callback(os.close, dfd)
+        try:
+            out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+        except FileExistsError:
+            return False, path + ": not restored, a file already exists at that path"
+        try:
+            with os.fdopen(out, "wb") as handle:
+                for chunk in iter(lambda: os.read(source, MIB), b""):
+                    handle.write(chunk)
+                handle.flush()
+                # Owner first: chown clears set-id bits that chmod then puts back.
+                os.fchown(handle.fileno(), item["uid"], item["gid"])
+                os.fchmod(handle.fileno(), int(item["mode"], 8))
+                os.utime(handle.fileno(), ns=(item["atime_ns"], item["mtime_ns"]))
+                os.fsync(handle.fileno())
+        except BaseException:
+            os.unlink(name, dir_fd=dfd)
+            raise
+        remove_item(qfd, item["id"])
+        log_action(qfd, "restore", item)
+    return True, path + ": restored"
+
+
+def purge_item(item, quarantine_dir):
+    qfd = private_directory(quarantine_dir)
+    try:
+        remove_item(qfd, item["id"])
+        log_action(qfd, "purge", item)
+    finally:
+        os.close(qfd)
+    return True, item["original_path"] + ": quarantined copy permanently deleted"
+
+
+def parse_selection(text, count, high=()):
+    """'1 3-5', 'h' (all HIGH), 'a' (all) or blank (none) -> sorted zero-based indexes."""
+    chosen = set()
+    for token in re.split(r"[\s,]+", text.strip().lower()):
+        if not token:
+            continue
+        if token in ("a", "all"):
+            chosen.update(range(count))
+        elif token in ("h", "high"):
+            chosen.update(high)
+        else:
+            match = re.fullmatch(r"(\d+)(?:-(\d+))?", token)
+            if not match:
+                raise ValueError("Unknown choice " + repr(token) + ": use numbers, ranges, h, a or Enter")
+            first, last = int(match.group(1)), int(match.group(2) or match.group(1))
+            if not 1 <= first <= last <= count:
+                raise ValueError(f"Choose numbers between 1 and {count}")
+            chosen.update(range(first - 1, last))
+    return sorted(chosen)
+
+
+def choose(items, ask, describe, verb):
+    for number, item in enumerate(items, 1):
+        print(f"{number:4d}. {describe(item)}")
+    high = [index for index, item in enumerate(items) if item.get("severity") == "HIGH"]
+    while True:
+        answer = ask(verb + " which? Numbers (e.g. 1 3-5), h = all HIGH, a = all, Enter = none: ")
+        try:
+            return [items[index] for index in parse_selection(answer, len(items), high)]
+        except ValueError as exc:
+            print(str(exc) + ".")
+
+
+def apply_each(items, action):
+    failed = 0
+    for item in items:
+        try:
+            ok, message = action(item)
+        except (OSError, ValueError) as exc:
+            ok, message = False, str(exc)
+        print(("  OK    " if ok else "  SKIP  ") + message, flush=True)
+        failed += not ok
+    return 1 if failed else 0
+
+
+def confirm_and_apply(items, ask, describe, verb, question, accepted, action):
+    """Shared prompt: choose, confirm, act. Enter, 'no', Ctrl+C or a closed session change nothing."""
+    try:
+        chosen = choose(items, ask, describe, verb)
+        if chosen and accepted(ask(question.format(count=len(chosen)))):
+            return apply_each(chosen, action)
+    except (EOFError, KeyboardInterrupt):
+        print()
+    print("No files changed.", flush=True)
+    return 0
+
+
+def offer_quarantine(report_dir, quarantine_dir, ask=input, candidates=None):
+    try:
+        if candidates is None:
+            candidates = quarantine_candidates(report_dir)
+    except (OSError, ValueError) as exc:
+        print("Cannot read report " + report_dir + ": " + str(exc), file=sys.stderr)
+        return 2
+    if not candidates:
+        print("No HIGH/REVIEW file findings to quarantine in " + report_dir + ".")
+        return 0
+    print(f"\n{len(candidates)} flagged file(s). Quarantine moves a file out of its site into {quarantine_dir}, keeping an")
+    print("exact copy for --restore. A site that loads the file may show errors until it is restored.")
+    return confirm_and_apply(
+        candidates, ask, lambda c: f"{c['severity']:<6} {c['path']}  [{', '.join(str(r) for r in c['rules'])}]",
+        "Quarantine", "Quarantine {count} file(s) now? [y/N]: ", lambda answer: answer.strip().lower() in ("y", "yes"),
+        lambda candidate: quarantine_file(candidate, quarantine_dir, report_dir))
+
+
+def describe_item(item):
+    return (f"{item.get('severity') or '?':<6} {item['original_path']}  quarantined {item.get('quarantined_utc', '?')}, "
+            f"{item.get('size', 0):,} bytes")
+
+
+def offer_items(quarantine_dir, ask, verb, question, accepted, action):
+    try:
+        items = quarantined_items(quarantine_dir)
+    except (OSError, ValueError) as exc:
+        print("Cannot open quarantine " + quarantine_dir + ": " + str(exc), file=sys.stderr)
+        return 2
+    if not items:
+        print("The quarantine " + quarantine_dir + " is empty.")
+        return 0
+    return confirm_and_apply(items, ask, describe_item, verb, question, accepted,
+                             lambda item: action(item, quarantine_dir))
+
+
+def offer_restore(quarantine_dir, ask=input):
+    return offer_items(quarantine_dir, ask, "Restore", "Put {count} file(s) back where they were? [y/N]: ",
+                       lambda answer: answer.strip().lower() in ("y", "yes"), restore_item)
+
+
+def offer_purge(quarantine_dir, ask=input):
+    return offer_items(quarantine_dir, ask, "Delete",
+                       "Permanently delete {count} quarantined file(s)? This cannot be undone. Type DELETE to confirm: ",
+                       lambda answer: answer.strip() == "DELETE", purge_item)
+
+
+def offer_after_scan(report_dir, args, ask=input):
+    """After the summary and any notification: offer quarantine at a terminal, and always print the later command."""
+    try:
+        candidates = quarantine_candidates(report_dir)
+    except (OSError, ValueError):
+        return
+    if not candidates:
+        return
+    command = "/usr/bin/python3 -I " + shlex.quote(os.path.abspath(__file__)) + " --quarantine " + shlex.quote(report_dir)
+    if os.path.abspath(args.quarantine_dir) != QUARANTINE_DIR:
+        command += " --quarantine-dir " + shlex.quote(args.quarantine_dir)
+    print(f"\n{len(candidates)} flagged file(s) can be quarantined now or later, without scanning again:\n  {command}", flush=True)
+    if interactive_terminal():
+        offer_quarantine(report_dir, args.quarantine_dir, ask, candidates)
+
+
+def run_quarantine_action(args, ask=input):
+    if not interactive_terminal():
+        print("--quarantine, --restore and --purge change files only after you choose them: run them in an interactive terminal.",
+              file=sys.stderr)
+        return 2
+    os.umask(0o077)
+    quarantine_dir = os.path.abspath(args.quarantine_dir)
+    if args.quarantine:
+        return offer_quarantine(os.path.abspath(args.quarantine), quarantine_dir, ask)
+    if args.restore:
+        return offer_restore(quarantine_dir, ask)
+    return offer_purge(quarantine_dir, ask)
+
+
 def main():
     args = parse_options()
     if not sys.platform.startswith("linux") or os.geteuid() != 0:
         print("Run this on the Ubuntu server as root using /usr/bin/python3 -I.", file=sys.stderr)
         return 2
+    if args.quarantine or args.restore or args.purge:
+        return run_quarantine_action(args)
     try:
         notify_token = read_notification_token(args.notify_token_file)
     except (OSError, ValueError):
@@ -991,6 +1418,12 @@ def main():
     if args.notify_url:
         payload = notification_payload(args, report, started, time.monotonic() - started_monotonic, complete, finalized, exit_code)
         send_notification(args, payload, notify_token)
+    if finalized:
+        # Offering quarantine never changes the scan's exit code.
+        try:
+            offer_after_scan(out, args)
+        except (EOFError, KeyboardInterrupt):
+            print("\nNo files changed.", file=sys.stderr)
     return exit_code
 
 

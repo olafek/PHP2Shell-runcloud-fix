@@ -2,6 +2,7 @@
 import argparse
 import ast
 import bz2
+import contextlib
 import gzip
 import hashlib
 import http.server
@@ -11,6 +12,7 @@ import json
 import lzma
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -555,6 +557,16 @@ class LinuxFixtureTests(unittest.TestCase):
         (jail / "home/user/webapps/site/example.jpg").write_bytes(request_sample())
         review = subprocess.run([sys.executable, "-c", code, str(jail)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(review.returncode, 1, review.stdout.decode() + review.stderr.decode())
+        # Without a terminal nothing is offered or moved; the later command is printed instead.
+        self.assertIn(b"--quarantine /root/runcloud-triage-", review.stdout)
+        review_report = re.search(rb"Writing private report to: (\S+)", review.stdout).group(1).decode()
+        for action in (["--quarantine", review_report], ["--restore"], ["--purge"]):
+            refused = subprocess.run([sys.executable, "-c", code, str(jail)] + action, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(refused.returncode, 2, refused.stdout.decode() + refused.stderr.decode())
+            self.assertIn(b"interactive terminal", refused.stderr)
+        self.assertTrue((jail / "home/user/webapps/site/example.jpg").exists())
+        self.assertFalse((jail / "root/runcloud-quarantine").exists())
         notified_review = subprocess.run([sys.executable, "-c", code, str(jail)] + notify_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(notified_review.returncode, 1)
         incomplete = subprocess.run([sys.executable, "-c", code, str(jail), "--home", "/missing"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -583,6 +595,291 @@ class LinuxFixtureTests(unittest.TestCase):
             self.assertTrue((report / "SHA256SUMS").exists())
             saved_options = json.loads((report / "summary.jsonl").read_text())["options"]
             self.assertIn(saved_options["notify_url"], (None, "[configured]"))
+
+
+class SelectionTests(unittest.TestCase):
+    def test_numbers_ranges_and_shortcuts(self):
+        self.assertEqual(triage.parse_selection("1 3-4", 5), [0, 2, 3])
+        self.assertEqual(triage.parse_selection("2,2, 1", 5), [0, 1])
+        self.assertEqual(triage.parse_selection("a", 3), [0, 1, 2])
+        self.assertEqual(triage.parse_selection("h", 4, high=[0, 2]), [0, 2])
+        self.assertEqual(triage.parse_selection("  ", 4), [])
+
+    def test_out_of_range_or_unknown_choices_are_rejected(self):
+        for text in ("0", "6", "3-1", "x", "1-", "-2", "1 9"):
+            with self.assertRaises(ValueError):
+                triage.parse_selection(text, 5)
+
+
+class QuarantineOptionTests(unittest.TestCase):
+    def test_actions_are_exclusive_and_do_not_take_notification_options(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            for argv in (["--quarantine", "/root/r", "--restore"], ["--restore", "--purge"],
+                         ["--restore", "--notify-url", "https://example.test/hook"]):
+                with self.assertRaises(SystemExit):
+                    triage.parse_options(argv)
+        self.assertEqual(triage.parse_options(["--restore"]).quarantine_dir, "/root/runcloud-quarantine")
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "Filesystem tests require Linux")
+class QuarantineTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="runcloud-triage-quarantine-test-")
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.report_dir = self.root / "report"
+        self.report_dir.mkdir(mode=0o700)
+        self.qdir = str(self.root / "quarantine")
+        self.args = triage.parse_options([])
+        self.args.home = str(self.home)
+        self.args.since = "2026-10-01T00:00:00+00:00"
+        self.prompts = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, relative, data, mode=0o644):
+        path = self.home / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        path.chmod(mode)
+        return path
+
+    def scan(self, *paths, logs=()):
+        with contextlib.redirect_stdout(io.StringIO()):
+            report = triage.Report(str(self.report_dir), self.args)
+            for path in paths:
+                triage.scan_file(str(path), report)
+            for path in logs:
+                triage.scan_log(str(path), report)
+            report.finish(True)
+
+    def answers(self, *replies):
+        replies = list(replies)
+
+        def ask(prompt):
+            self.prompts.append(prompt)
+            if not replies:
+                raise EOFError()  # SSH session closed / Ctrl+D
+            return replies.pop(0)
+        return ask
+
+    def quarantine_all(self):
+        results = [triage.quarantine_file(c, self.qdir, str(self.report_dir))
+                   for c in triage.quarantine_candidates(str(self.report_dir))]
+        self.assertTrue(all(ok for ok, _ in results), results)
+
+    def shell_and_upload(self):
+        shell = self.write("alice/webapps/site/shell.php", request_sample(), mode=0o640)
+        upload = self.write("alice/webapps/site/wp-content/uploads/x.php", sample(b"echo 1;"))
+        return shell, upload
+
+    def test_lists_each_flagged_file_once_high_first_without_log_evidence(self):
+        shell, upload = self.shell_and_upload()
+        plain = self.write("alice/webapps/site/readme.txt", b"Ordinary static content")
+        log = self.write("alice/logs/access.log", b"GET /?q=%3C%3Fphp%20eval%28x%29\n")
+        self.scan(upload, plain, shell, logs=[log])
+        found = triage.quarantine_candidates(str(self.report_dir))
+        self.assertEqual([c["path"] for c in found], [str(shell), str(upload)])
+        self.assertEqual([c["severity"] for c in found], ["HIGH", "REVIEW"])
+        self.assertIn("request_to_execution", found[0]["rules"])
+
+    def test_quarantine_moves_the_file_into_a_private_copy(self):
+        shell, _ = self.shell_and_upload()
+        self.scan(shell)
+        [candidate] = triage.quarantine_candidates(str(self.report_dir))
+        ok, message = triage.quarantine_file(candidate, self.qdir, str(self.report_dir))
+        self.assertTrue(ok, message)
+        self.assertFalse(shell.exists())
+        [item] = triage.quarantined_items(self.qdir)
+        self.assertEqual(item["original_path"], str(shell))
+        content = Path(self.qdir) / item["id"] / "content"
+        self.assertEqual(content.read_bytes(), request_sample())
+        self.assertEqual(stat.S_IMODE(content.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(Path(self.qdir).stat().st_mode), 0o700)
+
+    def test_restore_puts_the_file_back_exactly(self):
+        shell, _ = self.shell_and_upload()
+        owner = (os.getuid(), os.getgid())
+        if os.geteuid() == 0:
+            os.chown(str(shell), 1234, 1235)
+            owner = (1234, 1235)
+        os.utime(str(shell), ns=(1600000000000000000, 1600000000123456789))
+        self.scan(shell)
+        self.quarantine_all()
+        [item] = triage.quarantined_items(self.qdir)
+        ok, message = triage.restore_item(item, self.qdir)
+        self.assertTrue(ok, message)
+        st = shell.stat()
+        self.assertEqual(shell.read_bytes(), request_sample())
+        self.assertEqual(stat.S_IMODE(st.st_mode), 0o640)
+        self.assertEqual(st.st_mtime_ns, 1600000000123456789)
+        self.assertEqual((st.st_uid, st.st_gid), owner)
+        self.assertEqual(triage.quarantined_items(self.qdir), [])
+
+    def test_a_file_changed_since_the_scan_is_left_alone(self):
+        shell, _ = self.shell_and_upload()
+        self.scan(shell)
+        shell.write_bytes(request_sample() + b" ")
+        [candidate] = triage.quarantine_candidates(str(self.report_dir))
+        ok, message = triage.quarantine_file(candidate, self.qdir, str(self.report_dir))
+        self.assertFalse(ok)
+        self.assertIn("changed since the scan", message)
+        self.assertEqual(shell.read_bytes(), request_sample() + b" ")
+        self.assertEqual(triage.quarantined_items(self.qdir), [])
+
+    def test_a_file_already_gone_is_reported_not_moved(self):
+        shell, _ = self.shell_and_upload()
+        self.scan(shell)
+        shell.unlink()
+        [candidate] = triage.quarantine_candidates(str(self.report_dir))
+        ok, message = triage.quarantine_file(candidate, self.qdir, str(self.report_dir))
+        self.assertFalse(ok)
+        self.assertIn("no longer exists", message)
+
+    def test_a_symlinked_parent_directory_is_never_followed(self):
+        shell, _ = self.shell_and_upload()
+        self.scan(shell)
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "shell.php").write_bytes(request_sample())
+        site = shell.parent
+        site.rename(site.with_name("site-moved"))
+        site.symlink_to(elsewhere)
+        [candidate] = triage.quarantine_candidates(str(self.report_dir))
+        ok, _ = triage.quarantine_file(candidate, self.qdir, str(self.report_dir))
+        self.assertFalse(ok)
+        self.assertTrue((elsewhere / "shell.php").exists())
+        self.assertEqual(triage.quarantined_items(self.qdir), [])
+
+    def test_a_partially_read_file_matches_on_its_recorded_prefix_and_size(self):
+        self.args.max_file_mib = 1
+        big = self.write("alice/webapps/site/big.php", request_sample() + b"a" * (triage.MIB + 10))
+        self.scan(big)
+        [candidate] = triage.quarantine_candidates(str(self.report_dir))
+        ok, message = triage.quarantine_file(candidate, self.qdir, str(self.report_dir))
+        self.assertTrue(ok, message)
+
+    def test_a_partially_read_file_that_grew_is_left_alone(self):
+        self.args.max_file_mib = 1
+        big = self.write("alice/webapps/site/big.php", request_sample() + b"a" * (triage.MIB + 10))
+        self.scan(big)
+        with big.open("ab") as handle:
+            handle.write(b"appended after the scan")
+        [candidate] = triage.quarantine_candidates(str(self.report_dir))
+        ok, message = triage.quarantine_file(candidate, self.qdir, str(self.report_dir))
+        self.assertFalse(ok)
+        self.assertIn("changed since the scan", message)
+        self.assertTrue(big.exists())
+
+    def test_other_hard_links_are_reported(self):
+        shell, _ = self.shell_and_upload()
+        os.link(str(shell), str(shell.with_name("copy.php")))
+        self.scan(shell)
+        [candidate] = triage.quarantine_candidates(str(self.report_dir))
+        ok, message = triage.quarantine_file(candidate, self.qdir, str(self.report_dir))
+        self.assertTrue(ok, message)
+        self.assertIn("1 other hard link", message)
+
+    def test_restore_never_overwrites_a_newer_file(self):
+        shell, _ = self.shell_and_upload()
+        self.scan(shell)
+        self.quarantine_all()
+        shell.write_bytes(b"redeployed file")
+        [item] = triage.quarantined_items(self.qdir)
+        ok, message = triage.restore_item(item, self.qdir)
+        self.assertFalse(ok)
+        self.assertIn("already exists", message)
+        self.assertEqual(shell.read_bytes(), b"redeployed file")
+        self.assertEqual(len(triage.quarantined_items(self.qdir)), 1)
+
+    def test_purge_deletes_only_the_chosen_copy(self):
+        shell, upload = self.shell_and_upload()
+        self.scan(shell, upload)
+        self.quarantine_all()
+        first, second = triage.quarantined_items(self.qdir)
+        ok, message = triage.purge_item(first, self.qdir)
+        self.assertTrue(ok, message)
+        self.assertFalse((Path(self.qdir) / first["id"]).exists())
+        self.assertEqual([i["id"] for i in triage.quarantined_items(self.qdir)], [second["id"]])
+        self.assertFalse(shell.exists())
+
+    def test_every_action_is_logged(self):
+        shell, _ = self.shell_and_upload()
+        self.scan(shell)
+        self.quarantine_all()
+        triage.restore_item(triage.quarantined_items(self.qdir)[0], self.qdir)
+        self.quarantine_all()
+        triage.purge_item(triage.quarantined_items(self.qdir)[0], self.qdir)
+        rows = [json.loads(line) for line in (Path(self.qdir) / "actions.jsonl").read_text().splitlines()]
+        self.assertEqual([r["action"] for r in rows], ["quarantine", "restore", "quarantine", "purge"])
+        self.assertEqual({r["original_path"] for r in rows}, {str(shell)})
+        self.assertEqual({r["sha256"] for r in rows}, {hashlib.sha256(request_sample()).hexdigest()})
+
+    def test_report_and_quarantine_folders_must_be_private(self):
+        shell, _ = self.shell_and_upload()
+        self.scan(shell)
+        self.report_dir.chmod(0o755)
+        with self.assertRaises(ValueError):
+            triage.quarantine_candidates(str(self.report_dir))
+        self.report_dir.chmod(0o700)
+        Path(self.qdir).mkdir(mode=0o755)
+        Path(self.qdir).chmod(0o755)
+        [candidate] = triage.quarantine_candidates(str(self.report_dir))
+        with self.assertRaises(ValueError):
+            triage.quarantine_file(candidate, self.qdir, str(self.report_dir))
+        self.assertTrue(shell.exists())
+
+    def test_prompt_moves_only_the_chosen_files_after_confirmation(self):
+        shell, upload = self.shell_and_upload()
+        self.scan(shell, upload)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = triage.offer_quarantine(str(self.report_dir), self.qdir, ask=self.answers("1", "y"))
+        self.assertEqual(code, 0)
+        self.assertFalse(shell.exists())
+        self.assertTrue(upload.exists())
+        self.assertIn(str(upload), out.getvalue())
+
+    def test_skipping_declining_or_closing_the_prompt_changes_nothing(self):
+        shell, upload = self.shell_and_upload()
+        self.scan(shell, upload)
+        for replies in (("",), ("a", "n"), ("a",), ()):
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = triage.offer_quarantine(str(self.report_dir), self.qdir, ask=self.answers(*replies))
+            self.assertEqual(code, 0, replies)
+            self.assertTrue(shell.exists() and upload.exists(), replies)
+
+    def test_an_invalid_choice_is_asked_again(self):
+        shell, upload = self.shell_and_upload()
+        self.scan(shell, upload)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            triage.offer_quarantine(str(self.report_dir), self.qdir, ask=self.answers("9", "h", "y"))
+        self.assertIn("Choose", out.getvalue())
+        self.assertFalse(shell.exists())
+        self.assertTrue(upload.exists())
+
+    def test_restore_prompt_restores_the_chosen_file(self):
+        shell, upload = self.shell_and_upload()
+        self.scan(shell, upload)
+        self.quarantine_all()
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = triage.offer_restore(self.qdir, ask=self.answers("1", "y"))
+        self.assertEqual(code, 0)
+        self.assertTrue(shell.exists())
+        self.assertFalse(upload.exists())
+
+    def test_purge_prompt_needs_the_word_delete(self):
+        shell, upload = self.shell_and_upload()
+        self.scan(shell, upload)
+        self.quarantine_all()
+        with contextlib.redirect_stdout(io.StringIO()):
+            triage.offer_purge(self.qdir, ask=self.answers("1", "y"))
+        self.assertEqual(len(triage.quarantined_items(self.qdir)), 2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = triage.offer_purge(self.qdir, ask=self.answers("1", "DELETE"))
+        self.assertEqual(code, 0)
+        self.assertEqual([i["original_path"] for i in triage.quarantined_items(self.qdir)], [str(upload)])
 
 
 if __name__ == "__main__":
