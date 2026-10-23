@@ -14,9 +14,9 @@ This is a first-pass investigation tool for the PHP vulnerabilities announced on
 
 The public repository is [olafek/PHP2Shell-runcloud-fix](https://github.com/olafek/PHP2Shell-runcloud-fix). The steps below use `curl` inside your server's SSH session to download the scanner and its checksum. No Git installation, repository clone, or GitHub login is needed.
 
-The download examples pin scanner **1.8.0** to verified commit `f6b9d3cea8ed5930363c8e7842aaa2f1c3e1155d`. Both files come from that exact commit. Mutable `master` URLs can temporarily serve a new script with an older cached checksum, or change between requests. For a newer release, use one full commit hash whose published script/checksum pair has been verified; do not mix references or bypass checksum verification.
+The download examples pin scanner **1.9.0** to verified commit `d7dc60f57593b835a063e219f021800593066489`. Both files come from that exact commit. Mutable `master` URLs can temporarily serve a new script with an older cached checksum, or change between requests. For a newer release, use one full commit hash whose published script/checksum pair has been verified; do not mix references or bypass checksum verification.
 
-The working source is **1.9.0**, which adds checkpoints and `--resume`. The pinned download above remains 1.8.0 until a published 1.9.0 script/checksum pair has been verified. Resume requires scans started with 1.9.0 or newer; upgrading cannot recover checkpoints from an older scan.
+Version **1.9.0** adds checkpoints and `--resume`. Resume requires scans started with 1.9.0 or newer; upgrading cannot recover checkpoints from an older scan.
 
 ## 2. Log in and check requirements
 
@@ -52,7 +52,7 @@ Paste this entire block as root into a fresh SSH prompt, then press Enter. It wo
     umask 077 &&
     install -d -o root -g root -m 0700 /root/runcloud-triage &&
     cd /root/runcloud-triage &&
-    TRIAGE_REF='f6b9d3cea8ed5930363c8e7842aaa2f1c3e1155d' &&
+    TRIAGE_REF='d7dc60f57593b835a063e219f021800593066489' &&
     TRIAGE_RAW_BASE="https://raw.githubusercontent.com/olafek/PHP2Shell-runcloud-fix/$TRIAGE_REF" &&
     curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py" -o runcloud-triage.py &&
     curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py.sha256" -o runcloud-triage.py.sha256 &&
@@ -242,7 +242,7 @@ Download into your home directory, outside `webapps`:
     umask 077 &&
     install -d -m 0700 "$HOME/runcloud-triage" &&
     cd "$HOME/runcloud-triage" &&
-    TRIAGE_REF='f6b9d3cea8ed5930363c8e7842aaa2f1c3e1155d' &&
+    TRIAGE_REF='d7dc60f57593b835a063e219f021800593066489' &&
     TRIAGE_RAW_BASE="https://raw.githubusercontent.com/olafek/PHP2Shell-runcloud-fix/$TRIAGE_REF" &&
     curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py" -o runcloud-triage.py &&
     curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py.sha256" -o runcloud-triage.py.sha256 &&
