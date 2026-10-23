@@ -161,10 +161,36 @@ cat /root/runcloud-background.a1B2c3/exit-code
 
 The configured completion callback still runs. Background scans have no interactive terminal and cannot prompt to quarantine files. Review the report after completion, then use `--quarantine REPORT_DIR` in a new interactive SSH session if needed. Do not start another scan just because the original SSH session closed.
 
-**Reopen the quarantine prompt after a root background scan:** wait until `exit-code` appears, reconnect as root and find the report path in that run's log (replace `a1B2c3` with your saved background folder):
+#### Recover RUN_DIR and reopen the saved commands
+
+`RUN_DIR` is the **background-log folder**, such as `/root/runcloud-background.a1B2c3`. The launch block sets it inside parentheses, so it is not kept in your current shell; reconnecting also loses shell variables. The saved folder and log remain available.
+
+To find an earlier root run, reconnect as root and list the saved folders:
 
 ```bash
-grep -m1 '^Writing private report to:' /root/runcloud-background.a1B2c3/scan.log
+ls -1dt /root/runcloud-background.*/
+```
+
+For a RunCloud user scan, reconnect as that account and use `ls -1dt "$HOME"/runcloud-background.*/` instead. The list is ordered by folder modification time; an older run finishing can move to the top, so choose the run you want rather than assuming the first is the latest scan. No matching folders means no saved background run was found at that location.
+
+Paste this block, then paste the full folder path from the list when prompted. It restores `RUN_DIR` in the current shell and displays the report path and any saved resume/quarantine commands:
+
+```bash
+printf 'Paste the full background-run directory: ';
+if IFS= read -r RUN_DIR && [ -n "$RUN_DIR" ] && [ -f "$RUN_DIR/scan.log" ]; then
+    printf 'Selected run: %s\n' "$RUN_DIR";
+    grep -E -- '^Writing private report to:|^Resume after interruption:|^  /usr/bin/python3 -I .* --quarantine ' "$RUN_DIR/scan.log";
+else
+    printf 'No scan.log found there; check the path and try again.\n';
+fi;
+```
+
+This only displays saved commands. The quarantine command appears after a root scan finishes with eligible file findings; it preserves options such as `--include-review` and `--quarantine-root`. User-account scans cannot open quarantine. To reopen the end of the log, including the summary, use `tail -n 80 "$RUN_DIR/scan.log"`; to follow progress, use `tail -n 30 -f "$RUN_DIR/scan.log"`. Check the saved exit code with `cat "$RUN_DIR/exit-code"`.
+
+**Reopen the quarantine prompt after a root background scan:** recover `RUN_DIR` above, wait until its `exit-code` appears, then copy the saved quarantine command into your interactive root terminal. If you need to build the command yourself, retrieve the report path:
+
+```bash
+grep -m1 '^Writing private report to:' "$RUN_DIR/scan.log"
 ```
 
 Use the printed **report** directory, not the background-log folder:
@@ -290,7 +316,7 @@ Put callback/scan options after the script path and before `< /dev/null`. Reconn
 RUN_DIR=$(ls -1dt "$HOME"/runcloud-background.*/ 2>/dev/null | head -n 1); if [ -n "$RUN_DIR" ]; then printf 'Watching %s\n' "$RUN_DIR"; tail -n 30 -f "$RUN_DIR/scan.log"; else printf 'No background scan folders found.\n'; fi;
 ```
 
-Ctrl+C stops watching, not the scan. The latest-folder caveat, saved exit code and progress behaviour are the same as in the root background instructions above. This does not repeat or survive a reboot.
+Ctrl+C stops watching, not the scan. The latest-folder caveat, saved exit code and progress behaviour are the same as in the root background instructions above. To find an earlier run and reopen its saved commands, see [Recover RUN_DIR](#recover-run_dir-and-reopen-the-saved-commands). This does not repeat or survive a reboot.
 
 ### Reading the progress bar
 
@@ -628,7 +654,7 @@ Streambrain offers an unchecked **Include REVIEW files in the SSH quarantine pro
 
 Omit `--include-review` when reopening the report to return to the default HIGH-only list.
 
-If the SSH session closed, or you want to decide later, use the report folder the scan printed. Nothing is scanned again:
+If the SSH session closed, or you want to decide later, use the report folder the scan printed. For a background scan whose path you did not save, [recover RUN_DIR and display its saved commands](#recover-run_dir-and-reopen-the-saved-commands). Nothing is scanned again:
 
 ```bash
 /usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --quarantine /root/runcloud-triage-SERVER-20261022T120000Z-a1b2c3d4
