@@ -39,7 +39,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 MIB = 1024 * 1024
 # Not named runcloud-triage-* so it is never mistaken for (or globbed with) a report folder.
 QUARANTINE_DIR = "/root/runcloud-quarantine"
@@ -91,6 +91,10 @@ ZEEK_NOTICES = {
 }
 SURICATA_RULES = {3000650: "Upload_Progress_Marker", 3000651: "Potentially_Affected_PHP_Header",
                   3000652: "Potentially_Affected_PHP_Info"}
+SCAN_OPTIONS = ("home", "extra_root", "log_root", "since", "patched_at", "vendor_baseline",
+                "assess_php", "zeek_notice", "suricata_eve", "quick", "max_file_mib",
+                "max_log_mib", "max_total_log_mib", "log_samples")
+FILE_STREAMS = {"files", "recent-files", "findings", "coverage", "vendor-integrity", "persistence", "configuration"}
 
 
 def utc(ts):
@@ -391,6 +395,8 @@ class Report:
         self.scan_complete = False
         self.vendor_baseline = {}
         self.vendor_checked = set()
+        self.checkpoints = None
+        self.inspected_identity = None
 
     def emit(self, stream, row):
         if stream not in self.handles:
@@ -419,18 +425,22 @@ class Report:
         self.sites[row["site"]][row["severity"]] += 1
         if save:
             self.emit("findings", row)
-            if self.notification_findings is not None:
-                # Explicit fields only: never upload log excerpts or arbitrary evidence.
-                finding = {key: row[key] for key in (
-                    "path", "site", "severity", "rule", "reason", "line", "byte_offset",
-                    "line_or_chunk", "sha256", "content_complete", "mtime_utc", "ctime_utc", "birthtime_utc",
-                    "expected_sha256", "package", "version", "source", "sensor_rule",
-                    "event_utc", "source_ip", "destination_ip", "source_port", "destination_port",
-                    "sensor_event_id", "assessment", "fixed_version", "serving_runtime_verified", "role"
-                ) if key in row}
-                finding["kind"] = row.get("kind", "log" if "excerpt" in row else "file")
-                self.notification_findings.append(finding)
-        if save and row["severity"] != "INFO" and len(self.preview) < 40:
+            self.remember_finding(row)
+
+    def remember_finding(self, row):
+        if self.notification_findings is not None:
+            # Explicit fields only: never upload log excerpts or arbitrary evidence.
+            finding = {key: row[key] for key in (
+                "path", "site", "severity", "rule", "reason", "line", "byte_offset",
+                "line_or_chunk", "sha256", "content_complete", "mtime_utc", "ctime_utc", "birthtime_utc",
+                "expected_sha256", "package", "version", "source", "sensor_rule",
+                "event_utc", "source_ip", "destination_ip", "source_port", "destination_port",
+                "sensor_event_id", "assessment", "fixed_version", "serving_runtime_verified", "role",
+                "inspected_utc", "reused"
+            ) if key in row}
+            finding["kind"] = row.get("kind", "log" if "excerpt" in row else "file")
+            self.notification_findings.append(finding)
+        if row["severity"] != "INFO" and len(self.preview) < 40:
             self.preview.append({k: row[k] for k in ("severity", "rule", "path")})
 
     def progress(self, phase=None, force=False):
@@ -466,6 +476,8 @@ class Report:
         message += (f" | Matches={sum(self.severities.values()):,}"
                     f" HIGH={self.severities['HIGH']:,} REVIEW={self.severities['REVIEW']:,}"
                     f" INFO={self.severities['INFO']:,}")
+        if self.args.resume:
+            message += f" | Reused={self.counts['files_reused']:,}"
         if self.interactive:
             # Stay below the last column so a long status cannot wrap into a list.
             width = max(1, shutil.get_terminal_size((80, 24)).columns - 1)
@@ -495,6 +507,7 @@ class Report:
             "indicators": dict(self.severities), "coverage_issues": dict(self.gaps),
             "sites": dict(self.sites), "options": options,
             "optional_checks": optional_checks(self.args),
+            "resumed_from": self.args.resume,
             "verdict": "REVIEW_REQUIRED" if self.severities["HIGH"] or self.severities["REVIEW"] else "NO_MATCHING_INDICATORS",
             "warning": "Not a clean bill of health. Indicators are heuristics, not proof. Review coverage and inventories.",
         }
@@ -523,6 +536,7 @@ class Report:
                   "A live scan is not atomic. Reads may update access times; command execution creates normal audit records.",
                   "Optional checks: " + json.dumps(optional_checks(self.args)),
                   "See php-runtime.jsonl and network-alerts.jsonl when optional checks were enabled.",
+                  "Resume reuses file evidence only when identity/size/mtime/ctime/mode/owner match; it is not a fresh content verification.",
                   "Review serving FPM pools and worker restarts separately; installed packages are not proof of the running patch.",
                   "Keep this directory private. Logs and process arguments can contain secrets.", ""]
         with open(self.out / "summary.txt", "x", encoding="utf-8") as handle:
@@ -545,6 +559,315 @@ class Report:
         print("\n" + "\n".join(lines[:11]), flush=True)
 
 
+def file_identity(st):
+    return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+            st.st_mode, st.st_uid, st.st_gid, st.st_nlink]
+
+
+def current_identity(path):
+    try:
+        handle, _ = open_regular(path)
+        with handle:
+            return file_identity(os.fstat(handle.fileno()))
+    except OSError:
+        return None
+
+
+def checkpoint_identity():
+    machine = None
+    try:
+        handle, _ = open_regular("/etc/machine-id")
+        with handle:
+            machine = handle.read(256).decode("ascii").strip()
+    except (OSError, UnicodeError):
+        pass
+    handle, _ = open_regular(os.path.abspath(__file__))
+    with handle:
+        digest = hashlib.sha256(handle.read()).hexdigest()
+    return {"version": VERSION, "script_sha256": digest, "hostname": socket.gethostname(),
+            "machine_id": machine, "uid": os.geteuid()}
+
+
+def checkpoint_line(record):
+    payload = json.dumps(record, ensure_ascii=True, separators=(",", ":"))
+    line = (json.dumps({"payload": payload, "sha256": hashlib.sha256(payload.encode("ascii")).hexdigest()},
+                      separators=(",", ":")) + "\n").encode("ascii")
+    if len(line) > 4 * MIB:
+        raise ValueError("Checkpoint record exceeds 4 MiB")
+    return line
+
+
+def read_checkpoint_line(handle):
+    line = handle.readline(4 * MIB + 1)
+    if len(line) > 4 * MIB:
+        raise ValueError("Checkpoint record exceeds 4 MiB")
+    return line
+
+
+def checkpoint_record(line):
+    try:
+        envelope = json.loads(line.decode("ascii"))
+        payload = envelope["payload"]
+        if hashlib.sha256(payload.encode("ascii")).hexdigest() != envelope["sha256"]:
+            raise ValueError("checksum mismatch")
+        record = json.loads(payload)
+        if not isinstance(record, dict):
+            raise ValueError("expected object")
+        return record
+    except (ValueError, KeyError, TypeError, AttributeError, UnicodeError) as exc:
+        raise ValueError("Damaged checkpoint; keep the old report and start a fresh scan: " + str(exc))
+
+
+def validate_file_checkpoint(record):
+    def counter(value):
+        return isinstance(value, dict) and all(isinstance(k, str) and type(v) is int and v >= 0 for k, v in value.items())
+    path, identity, rows = record.get("path"), record.get("identity"), record.get("rows")
+    if (not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path
+            or record.get("kind") not in ("file", "temp", "config", "persistence")
+            or not isinstance(identity, list) or len(identity) != 9 or not all(type(v) is int for v in identity)
+            or not isinstance(record.get("inspected_utc"), str)
+            or not isinstance(rows, list)
+            or not all(isinstance(row, list) and len(row) == 2 and isinstance(row[0], str) and row[0] in FILE_STREAMS
+                       and isinstance(row[1], dict) and row[1].get("path") == path for row in rows)
+            or not all(counter(record.get(name)) for name in ("counts", "severities", "gaps"))
+            or not isinstance(record.get("sites"), dict)
+            or not all(isinstance(k, str) and counter(v) for k, v in record["sites"].items())
+            or record.get("vendor_checked") not in ([], [path])
+            or {"file_read_error", "changed_during_read"}.intersection(record["gaps"])):
+        raise ValueError("Invalid file checkpoint; start a fresh scan")
+
+
+class ResumeSource:
+    """Read-only source, locked for the lifetime of a resumed scan. No pickle or code loading."""
+    def __init__(self, path):
+        import fcntl
+        self.path = os.path.abspath(path)
+        self.handle = None
+        dfd = open_directory(self.path)
+        try:
+            st = os.fstat(dfd)
+            if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) & 0o077:
+                raise ValueError("Resume report must be owned by the current user with mode 0700")
+            try:
+                fd = os.open("checkpoint.jsonl", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+            except FileNotFoundError:
+                raise ValueError("This report has no checkpoints. Resume requires a scan started with scanner 1.9.0+; older scans must start again.")
+            self.handle = os.fdopen(fd, "rb")
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077 or st.st_nlink != 1:
+                raise ValueError("Checkpoint must be a private, singly linked regular file owned by the current user")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError("This scan or another resume is still running; do not start a duplicate")
+            self.header = checkpoint_record(read_checkpoint_line(self.handle))
+            if self.header.get("format") != 1 or self.header.get("identity") != checkpoint_identity():
+                raise ValueError("Resume requires the same server, user and exact scanner version/file that created the checkpoint")
+            try:
+                ready_fd = os.open("checkpoint-ready", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+            except FileNotFoundError:
+                raise ValueError("Checkpoint initialization was interrupted; resume its source report instead: "
+                                 + str(self.header.get("resumed_from") or "none (start a fresh scan)"))
+            try:
+                ready = os.fstat(ready_fd)
+                if (not stat.S_ISREG(ready.st_mode) or ready.st_uid != os.geteuid() or ready.st_mode & 0o077
+                        or ready.st_nlink != 1 or os.read(ready_fd, 32) != b"ready\n"):
+                    raise ValueError("Invalid checkpoint readiness marker")
+            finally:
+                os.close(ready_fd)
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            os.close(dfd)
+
+    def restore_options(self, args):
+        options = self.header.get("options")
+        if not isinstance(options, dict) or set(options) != set(SCAN_OPTIONS):
+            raise ValueError("Checkpoint scan options are invalid")
+        argv = []
+        for name in SCAN_OPTIONS:
+            value = options[name]
+            flag = "--" + name.replace("_", "-")
+            if isinstance(value, bool):
+                if value:
+                    argv.append(flag)
+            elif value is not None:
+                for part in value if isinstance(value, list) else [value]:
+                    argv.append(flag + "=" + str(part))
+        saved = parse_options(argv)
+        for name in SCAN_OPTIONS:
+            setattr(args, name, getattr(saved, name))
+        args.resume = self.path
+
+    def close(self):
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+
+class FileResult(Report):
+    """Collect one file's results so interrupted/failed reads never become reusable checkpoints."""
+    def __init__(self, report):
+        super().__init__(report.out, report.args)
+        self.parent = report
+        self.rows = []
+        self.notification_findings = None
+        self.vendor_baseline = report.vendor_baseline
+
+    def emit(self, stream, row):
+        self.rows.append([stream, row])
+
+    def progress(self, phase=None, force=False):
+        self.parent.progress(phase, force)
+
+    def record(self, path, kind):
+        return {"path": path, "kind": kind, "identity": self.inspected_identity, "inspected_utc": utc(time.time()),
+                "rows": self.rows, "counts": dict(self.counts), "severities": dict(self.severities),
+                "gaps": dict(self.gaps), "sites": {k: dict(v) for k, v in self.sites.items()},
+                "vendor_checked": sorted(self.vendor_checked)}
+
+
+def merge_file_result(report, record, reused=False):
+    for stream, row in record["rows"]:
+        if stream not in FILE_STREAMS or not isinstance(row, dict):
+            raise ValueError("Invalid checkpoint result stream")
+        row = dict(row, inspected_utc=record["inspected_utc"], reused=reused)
+        report.emit(stream, row)
+        if stream == "findings":
+            report.remember_finding(row)
+    for name in ("counts", "severities", "gaps"):
+        getattr(report, name).update(record[name])
+    for site, counts in record["sites"].items():
+        report.sites[site].update(counts)
+    report.vendor_checked.update(record["vendor_checked"])
+    if reused:
+        report.counts["files_reused"] += 1
+
+
+class Checkpoints:
+    """Append complete, checksummed records; index old records on disk, not in a million-file dict."""
+    def __init__(self, report, source=None):
+        import fcntl
+        self.report, self.source = report, source
+        self.handle, self.index = None, None
+        self.index_path = report.out / "resume-index.sqlite"
+        self.last_sync = time.monotonic()
+        self.pending = 0
+        header = {"format": 1, "identity": checkpoint_identity(),
+                  "resumed_from": report.args.resume,
+                  "options": {name: getattr(report.args, name) for name in SCAN_OPTIONS},
+                  "baseline_sha256": hashlib.sha256(json.dumps(report.vendor_baseline, sort_keys=True).encode("utf-8")).hexdigest()}
+        if source and source.header.get("baseline_sha256") != header["baseline_sha256"]:
+            raise ValueError("Vendor baseline changed since the checkpoint; start a fresh scan")
+        try:
+            fd = os.open(str(report.out / "checkpoint.jsonl"), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+            self.handle = os.fdopen(fd, "wb")
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.handle.write(checkpoint_line(header))
+            self.sync(force=True)
+            if source:
+                self.load_source()
+            fd = os.open(str(report.out / "checkpoint-ready"), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+            with os.fdopen(fd, "wb") as ready:
+                ready.write(b"ready\n")
+                ready.flush()
+                os.fsync(ready.fileno())
+        except BaseException:
+            self.close()
+            raise
+
+    def load_source(self):
+        try:
+            import sqlite3
+        except ImportError:
+            raise ValueError("Resume needs Python's standard-library sqlite3 module")
+        self.report.progress("Loading checkpoints", force=True)
+        # The database is only a disposable index in the NEW private report. The
+        # original checkpoint is never opened by SQLite or changed/recovered in place.
+        fd = os.open(str(self.index_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+        self.index = sqlite3.connect(str(self.index_path))
+        self.index.execute("PRAGMA journal_mode=OFF")
+        self.index.execute("PRAGMA synchronous=OFF")
+        self.index.execute("CREATE TABLE entries (path BLOB PRIMARY KEY, offset INTEGER NOT NULL)")
+        while True:
+            offset = self.source.handle.tell()
+            line = read_checkpoint_line(self.source.handle)
+            if not line:
+                break
+            if not line.endswith(b"\n"):
+                # Only a final torn write is recoverable. Earlier damaged records
+                # are an error, never silently treated as successfully inspected.
+                self.report.gap(self.source.path, "checkpoint_tail_incomplete", "Last unfinished checkpoint ignored; affected files are inspected again")
+                break
+            record = checkpoint_record(line)
+            validate_file_checkpoint(record)
+            self.index.execute("INSERT OR REPLACE INTO entries VALUES (?, ?)",
+                               (os.fsencode(record["path"]), offset))
+            self.report.progress()
+        self.index.commit()
+        # Carry all latest checkpoints forward, including paths not yet reached
+        # if THIS resume is interrupted. Old/deleted paths never enter the report
+        # unless encountered in a fresh traversal and successfully validated.
+        for (offset,) in self.index.execute("SELECT offset FROM entries ORDER BY offset"):
+            self.source.handle.seek(offset)
+            self.handle.write(read_checkpoint_line(self.source.handle))
+            self.sync()
+            self.report.progress()
+        self.sync(force=True)
+
+    def lookup(self, path, kind):
+        if self.index is None:
+            return None
+        found = self.index.execute("SELECT offset FROM entries WHERE path = ?", (os.fsencode(path),)).fetchone()
+        if found is None:
+            return None
+        self.source.handle.seek(found[0])
+        record = checkpoint_record(read_checkpoint_line(self.source.handle))
+        if record["kind"] == kind and record["identity"] == current_identity(path):
+            return record
+        return None
+
+    def add(self, record):
+        if (record["identity"] is not None and not {"file_read_error", "changed_during_read"}.intersection(record["gaps"])
+                and record["identity"] == current_identity(record["path"])):
+            self.handle.write(checkpoint_line(record))
+            # Flush whole items before progress advances; fsync batches bound disk
+            # overhead. A crash may lose recent items, which are simply re-read.
+            self.handle.flush()
+            self.pending += 1
+            self.sync()
+
+    def sync(self, force=False):
+        if self.handle is not None and (force or self.pending >= 100 or time.monotonic() - self.last_sync >= 5):
+            self.handle.flush()
+            os.fsync(self.handle.fileno())
+            self.pending = 0
+            self.last_sync = time.monotonic()
+
+    def close(self):
+        try:
+            if self.handle is not None:
+                try:
+                    self.seal()
+                finally:
+                    self.handle.close()
+                    self.handle = None
+        finally:
+            if self.index is not None:
+                self.index.close()
+                self.index = None
+                self.index_path.unlink()
+
+    def seal(self):
+        self.sync(force=True)
+        if self.index is not None:
+            self.index.close()
+            self.index = None
+            self.index_path.unlink()
+
+
 def walk_files(root, report, record=True):
     """Descriptor-relative traversal; never open a symlink, device, FIFO or socket."""
     visited = set()
@@ -562,7 +885,7 @@ def walk_files(root, report, record=True):
             for name in os.listdir(fd):
                 report.progress()
                 child = os.path.join(path, name)
-                if inside(child, str(report.out)):
+                if inside(child, str(report.out)) or (report.args.resume and inside(child, report.args.resume)):
                     continue  # Never ingest the report currently being written.
                 try:
                     st = os.stat(name, dir_fd=fd, follow_symlinks=False)
@@ -600,7 +923,7 @@ def walk_files(root, report, record=True):
             gap(path, "directory_read_error", exc)
 
     try:
-        if inside(root, str(report.out)):
+        if inside(root, str(report.out)) or (report.args.resume and inside(root, report.args.resume)):
             return
         st = os.lstat(root)
         if stat.S_ISREG(st.st_mode):
@@ -621,6 +944,7 @@ def read_prefix(path, limit, report, file_times=None):
         before = os.fstat(handle.fileno())
         if file_times is not None:
             file_times["birthtime_utc"] = file_birthtime(handle.fileno())
+            report.inspected_identity = file_identity(before)
         data = handle.read(limit + 1)
         after = os.fstat(handle.fileno())
     if not noatime:
@@ -1227,10 +1551,19 @@ def run_scan(report):
         elif kind == "log":
             scan_log(path, report)
         else:
-            scan_file(path, report, persistence=kind == "persistence", config=kind == "config")
-            if kind == "temp" and st.st_mode & 0o111:
-                report.finding(path, {"severity": "REVIEW", "rule": "executable_in_temp",
-                                      "reason": "Executable file in a temporary directory; verify its owner and purpose."})
+            cached = report.checkpoints.lookup(path, kind) if report.checkpoints else None
+            if cached is not None:
+                merge_file_result(report, cached, reused=True)
+            else:
+                item = FileResult(report) if report.checkpoints else report
+                scan_file(path, item, persistence=kind == "persistence", config=kind == "config")
+                if kind == "temp" and st.st_mode & 0o111:
+                    item.finding(path, {"severity": "REVIEW", "rule": "executable_in_temp",
+                                        "reason": "Executable file in a temporary directory; verify its owner and purpose."})
+                if report.checkpoints:
+                    record = item.record(path, kind)
+                    report.checkpoints.add(record)
+                    merge_file_result(report, record)
         report.completed_items += 1
         report.progress(phase)
     for path in sorted(set(report.vendor_baseline) - report.vendor_checked):
@@ -1244,7 +1577,7 @@ def run_scan(report):
 
 
 def parser():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     p.add_argument("--home", help="Scan all regular files below this directory (root: /home; user: account home/webapps)")
     p.add_argument("--extra-root", action="append", default=[], help="Additional real directory/file to inspect; repeatable")
     p.add_argument("--log-root", action="append", default=[], help="Additional log directory or log file; repeatable")
@@ -1268,6 +1601,8 @@ def parser():
     p.add_argument("--max-total-log-mib", type=bounded_int, help="Total decompressed log budget; default 8192 MiB, or 512 with --quick")
     p.add_argument("--log-samples", type=bounded_int, help="Saved excerpts per log; default 200, or 50 with --quick; counting continues")
     actions = p.add_mutually_exclusive_group()
+    actions.add_argument("--resume", metavar="REPORT_DIR",
+                         help="Resume a checkpointed scan into a NEW report; inherit scan options, reuse unchanged file checks, refresh logs/system checks (1.9.0+ reports only)")
     actions.add_argument("--quarantine", metavar="REPORT_DIR",
                          help="No scan: choose HIGH files from a previous report (add --include-review for REVIEW) and move them into quarantine")
     actions.add_argument("--restore", action="store_true",
@@ -1285,7 +1620,13 @@ def parser():
 
 def parse_options(argv=None):
     argument_parser = parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = argument_parser.parse_args(argv)
+    if args.resume:
+        supplied = {arg.split("=", 1)[0] for arg in argv}
+        conflicts = supplied & {"--" + name.replace("_", "-") for name in SCAN_OPTIONS}
+        if conflicts:
+            argument_parser.error("--resume inherits the original scan scope/limits; omit " + ", ".join(sorted(conflicts)))
     args.user_mode = hasattr(os, "geteuid") and os.geteuid() != 0
     if args.user_mode:
         import pwd
@@ -1400,6 +1741,9 @@ def notification_payload(args, report, started, elapsed, complete, finalized, ex
             "php_packages_assessed", "sensor_logs", "sensor_records", "sensor_records_ignored", "sensor_indicators",
             "php_version_below_upstream_fix", "php_version_at_or_above_upstream_fix",
             "php_version_legacy_requires_vendor_verification", "php_version_unknown")}
+    if args.resume:
+        payload["resumed_from"] = args.resume
+        payload["counts"]["files_reused"] = counts["files_reused"]
     if args.notify_findings:
         findings = report.notification_findings if report is not None else []
         payload.update(findings=findings, findings_count=len(findings), findings_scope="saved_findings",
@@ -1902,6 +2246,19 @@ def main():
         return 2
     if args.quarantine or args.restore or args.purge:
         return run_quarantine_action(args)
+    with ExitStack() as resources:
+        try:
+            source = ResumeSource(args.resume) if args.resume else None
+            if source:
+                resources.callback(source.close)
+                source.restore_options(args)
+            return scan_main(args, source, resources)
+        except (OSError, ValueError) as exc:
+            print("Cannot resume/checkpoint triage: " + str(exc), file=sys.stderr)
+            return 2
+
+
+def scan_main(args, source, resources):
     try:
         notify_token = read_notification_token(args.notify_token_file)
     except (OSError, ValueError):
@@ -1913,6 +2270,8 @@ def main():
         setattr(args, name, os.path.abspath(getattr(args, name)))
     args.extra_root = [os.path.abspath(p) for p in args.extra_root]
     args.log_root = [os.path.abspath(p) for p in args.log_root]
+    if args.vendor_baseline:
+        args.vendor_baseline = os.path.abspath(args.vendor_baseline)
     args.since = args.since.isoformat()
     args.patched_at = args.patched_at.isoformat() if args.patched_at else None
     out = None
@@ -1937,6 +2296,8 @@ def main():
             os.close(dfd)
         report = Report(out, args)
         report.vendor_baseline = baseline
+        report.checkpoints = Checkpoints(report, source)
+        resources.callback(report.checkpoints.close)
         try:
             script, _ = open_regular(os.path.abspath(__file__))
             with script:
@@ -1945,6 +2306,11 @@ def main():
         except OSError as exc:
             report.gap(__file__, "scanner_hash_unavailable", exc)
         print("Writing private report to: " + out, flush=True)
+        print("Resume after interruption: " + shlex.quote(sys.executable) + " -I " + shlex.quote(os.path.abspath(__file__))
+              + " --resume " + shlex.quote(out), flush=True)
+        if source:
+            print("Resuming from: " + source.path + ". Rechecking metadata; logs and system checks run again."
+                  " Repeat notification options to send this new report.", flush=True)
         if args.user_mode:
             print("User-account scan: " + args.home + ". System-wide checks and root-only quarantine are unavailable.", flush=True)
         print("Progress measures scan attempts. HIGH/REVIEW need investigation; INFO provides context. Matches are not confirmed infections.", flush=True)
@@ -1961,6 +2327,7 @@ def main():
             report.gap("scan", "interrupted", "Partial report only")
         except Exception as exc:
             report.gap("scan", "unexpected_error", f"{type(exc).__name__}: {exc}")
+        report.checkpoints.seal()
         report.finish(complete)
         finalized = True
         if complete and not any(key in report.gaps for key in ("root_unavailable", "directory_read_error", "traversal_error", "file_read_error", "log_read_error",

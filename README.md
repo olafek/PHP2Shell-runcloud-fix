@@ -16,6 +16,8 @@ The public repository is [olafek/PHP2Shell-runcloud-fix](https://github.com/olaf
 
 The download examples pin scanner **1.8.0** to verified commit `f6b9d3cea8ed5930363c8e7842aaa2f1c3e1155d`. Both files come from that exact commit. Mutable `master` URLs can temporarily serve a new script with an older cached checksum, or change between requests. For a newer release, use one full commit hash whose published script/checksum pair has been verified; do not mix references or bypass checksum verification.
 
+The working source is **1.9.0**, which adds checkpoints and `--resume`. The pinned download above remains 1.8.0 until a published 1.9.0 script/checksum pair has been verified. Resume requires scans started with 1.9.0 or newer; upgrading cannot recover checkpoints from an older scan.
+
 ## 2. Log in and check requirements
 
 For a server-wide scan, log in as root, or become root with `sudo -i`. For an account-only scan without sudo, use [Run as a RunCloud user](#run-as-a-runcloud-user-without-root) instead.
@@ -174,6 +176,60 @@ Use the printed **report** directory, not the background-log folder:
 This reads the saved findings and opens the interactive selection/confirmation prompt without rescanning. Nothing moves until you choose files and confirm. No candidates means there is nothing to select. Review dependency files against their release before quarantining them.
 
 Scanner 1.7.1+ lists only HIGH files by default, including when opening reports from earlier scanner versions. Add `--include-review` to the command above to list REVIEW files too.
+
+### Resume an interrupted scan
+
+**Scanner 1.9.0+ saves checkpoints automatically**, for foreground and background runs, as root or a RunCloud user. After an SSH disconnect, first check whether the original scanner still exists:
+
+```bash
+ps -eo pid,stat,etime,args | grep '[p]ython3.*runcloud-triage\.py'
+```
+
+If it is still running, let it continue rather than launching another scan. If it has stopped, use the **same server, SSH account and exact scanner file** to resume. Keep a copy of that scanner when upgrading before finishing an interrupted scan. Reports from 1.8.0 or earlier have no checkpoints and require a fresh scan.
+
+The scanner prints an exact `--resume` command alongside `Writing private report to:`. Alternatively, paste this block as root; when it prompts, paste the full interrupted **report directory** and press Enter. It does not choose the latest folder automatically, and you should not type a placeholder such as `REPORT_DIR`. Use the report path, not `/root/runcloud-background.XXXXXX`.
+
+```bash
+(
+    printf 'Paste the full interrupted report directory: ' &&
+    IFS= read -r REPORT_DIR &&
+    [ -n "$REPORT_DIR" ] &&
+    /usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --resume "$REPORT_DIR"
+);
+```
+
+**To resume in the background instead**, use this block. It prompts for the report path before detaching, then prints new watch/exit-code commands:
+
+```bash
+(
+    umask 077 &&
+    printf 'Paste the full interrupted report directory: ' &&
+    IFS= read -r REPORT_DIR &&
+    [ -n "$REPORT_DIR" ] &&
+    RUN_DIR=$(mktemp -d /root/runcloud-background.XXXXXX) &&
+    {
+        nohup /bin/sh -c 'run_dir=$1; shift; "$@"; result=$?; printf "%s\n" "$result" > "$run_dir/exit-code"; exit "$result"' sh "$RUN_DIR" /usr/bin/python3 -u -I /root/runcloud-triage/runcloud-triage.py --resume "$REPORT_DIR" < /dev/null > "$RUN_DIR/scan.log" 2>&1 &
+        printf '%s\n' "$!" > "$RUN_DIR/pid";
+        printf 'Background job: %s\nWatch: tail -f %s/scan.log\nExit code: cat %s/exit-code\n' "$RUN_DIR" "$RUN_DIR" "$RUN_DIR";
+    }
+);
+```
+
+For a user-account resume, use `"$HOME/runcloud-triage/runcloud-triage.py"` instead of the `/root` script path and `"$HOME/runcloud-background.XXXXXX"` for the background directory template. Reconnect as the original account. Streambrain supplies both root and user commands with the callback configured.
+
+Notification settings are deliberately **not saved in checkpoints**. Repeat your `--notify-url`, `--notify-token-file`, `--notify-findings` and `--notify-timeout` options on the resume command if you want the new report posted; for background runs put them before `< /dev/null`. A resumed callback has a new run ID, `resumed_from`, and `counts.files_reused`. Duration measures this attempt, excluding previous attempts and downtime.
+
+Resume behavior and limits:
+
+- It creates a **new private report**, preserving the old report unchanged. It reloads the original scan roots, dates, read limits and optional checks. Do not combine `--resume` with scan-setting flags such as `--home`, `--quick` or `--max-file-mib`. You may change `--output-parent`, use `--no-precount`, configure notifications, or set interactive quarantine options again.
+- It walks the current file list and reuses a completed file check only when device, inode, size, nanosecond modification/change times, mode, owner/group and link count still match. Changed, replaced, newly discovered, unreadable or previously unstable files are inspected again. Deleted files' old findings are not copied into the new report. A trusted vendor manifest must remain unchanged.
+- Reused file evidence keeps its original `inspected_utc`; file inventories/findings say `reused: true`. This is **metadata-based reuse**, not a fresh hash verification or an atomic snapshot. For a fresh content check or a suspected privileged attacker able to alter filesystem metadata, start without `--resume`. Quarantine still verifies the report's content hash before moving any file.
+- Logs and sensor imports are read again from the beginning, within the original limits; system snapshots and optional PHP assessment run again. An interrupted individual file is read again from its beginning. Original partial-read limits and coverage gaps remain visible on reused files. Previous traversal failures are checked afresh.
+- Progress shows `Reused=N`; cached files can make ETA optimistic before uncached files/logs begin. Initial counting and checkpoint loading can still take time on a large server. `--no-precount` skips counting and ETA.
+- Checkpoints are private, checksummed JSON records, with no application code execution. Complete file records are flushed as they finish; disk syncs are batched at 100 new records or the next checkpoint after five seconds. A power loss may lose recent checkpoints, which are re-read. A final torn record is ignored; corruption elsewhere stops resume. Interrupted checkpoint initialization points back to the source report.
+- An advisory lock refuses a resume while the original scan or another resume from that report is active. A resumed run carries forward unvisited checkpoints so it can itself be resumed. There is no automatic restart after a reboot. Keep the complete report directory, including `checkpoint.jsonl` and `checkpoint-ready`.
+
+Checkpoint storage duplicates completed file evidence and uses additional disk space. Resume builds a temporary on-disk index using Python's standard-library SQLite module, so millions of checkpoint rows are not loaded into a Python dictionary. The index is removed on normal finalization; after an abrupt kill it can remain in the interrupted report and is ignored by the next resume.
 
 ### Run as a RunCloud user without root
 
@@ -674,15 +730,15 @@ python3 -m py_compile runcloud-triage.py
 
 Linux filesystem fixtures test symlink/FIFO handling, age-independent coverage, report generation, compressed logs, limits and read failures. `tests/test_setup.py` checks the README commands in Bash and `/bin/sh` with offline download fixtures, including pasted command boundaries, private permissions, failed downloads and checksum mismatches. Its background fixture verifies that jobs continue after the launching shell exits and a hangup signal arrives, detach all terminal streams, and save exit codes 0/1/2. Run the tests as root in a disposable Linux environment. Detection and timestamp tests can also run on Windows; Linux-specific tests are skipped there. Python 3.6 grammar is checked on interpreters that provide AST grammar selection.
 
-Version 1.8.0 validation includes file/log timestamps in reports and callbacks, optional birth time through both libc and the older-libc syscall fallback, unavailable creation times, and quarantine restricted to one webapp without selecting neighbouring paths. The suite retains checks for entries disappearing during traversal, session-directory scanning, permission/I/O failures, callback statuses and exit codes, HIGH-only/REVIEW selection, optional package assessment and sensor imports, callback privacy, the Symfony documentation regression, trusted vendor baselines, root/user CLI runs, binary PHP-tag heuristics, private permissions, counting/ETA, background hangup handling, setup commands with spaces in home paths, and quarantine safeguards. Notification transport tests use a local HTTP receiver and do not contact external services.
+Version 1.9.0 validation adds forced-kill recovery in isolated root/user CLI runs, unchanged-file reuse, changed/new/deleted files, refreshed logs, repeated interruptions, partial-read coverage, retrying failed reads, source locks, torn/corrupt checkpoints, private storage and source immutability, exact scanner/settings checks, vendor baselines, callback counts, unusual filenames and quarantine hash verification after reuse. Shell tests exercise the background resume prompt with spaces and shell metacharacters in the report path. The suite retains file/log timestamps and optional birth time (including older-libc fallback), app-scoped quarantine, traversal races, permission/I/O failures, callbacks and exit codes, HIGH-only/REVIEW selection, optional assessments/imports, Symfony documentation and binary PHP-tag regressions, counting/ETA, background hangups and setup/checksum checks. Notification transport tests use a local HTTP receiver and do not contact external services.
 
 Older-runtime validation used packages verified against signed Ubuntu archive metadata in isolated chroots under WSL:
 
 | Ubuntu userspace | Python | Test result |
 | --- | --- | --- |
-| 22.04 (WSL) | 3.10.12 | 117 passed |
-| 18.04 | 3.6.9 | 116 passed; 1 skipped (AST grammar selection needs Python 3.8+) |
-| 20.04 | 3.8.10 | 117 passed |
+| 22.04 (WSL) | 3.10.12 | 132 passed |
+| 18.04 | 3.6.9 | 131 passed; 1 skipped (AST grammar selection needs Python 3.8+) |
+| 20.04 | 3.8.10 | 132 passed |
 
 Both also passed isolated `--help` and Bash/`/bin/sh` setup checks. Ubuntu's curl 7.58.0 and 7.68.0 accept the download options used here. This validates the older userspace and Python APIs; each server's RunCloud configuration, kernel and external HTTPS endpoint still need on-host validation.
 
@@ -703,4 +759,4 @@ $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath ./runcloud-triage.py).Has
 "$digest  runcloud-triage.py" | Set-Content -Encoding ascii ./runcloud-triage.py.sha256
 ```
 
-Preserve the script's bytes when uploading; line-ending changes change its checksum. `.gitattributes` keeps consistent LF line endings across workstations. Publish scanner and checksum updates together. After publishing, download both files using that full commit hash and verify the pair. Only then update both `TRIAGE_REF` examples here and Streambrain's `ServerScanReport::SCANNER_REF` to that verified commit. The instructions may be published in a later commit; their pinned download target must contain the matching scanner/checksum pair.
+Preserve the script's bytes when uploading; line-ending changes change its checksum. `.gitattributes` keeps consistent LF line endings across workstations. Publish scanner and checksum updates together. After publishing, download both files using that full commit hash and verify the pair. Only then update both `TRIAGE_REF` examples here, the release text above, and Streambrain's `ServerScanReport::SCANNER_REF` / `SCANNER_VERSION` to that verified commit/version. The instructions may be published in a later commit; their pinned download target must contain the matching scanner/checksum pair.

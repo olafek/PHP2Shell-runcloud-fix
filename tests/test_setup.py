@@ -133,7 +133,17 @@ class BackgroundTests(unittest.TestCase):
         command = re.findall(r"```bash\n(.*?)\n```", section, re.S)[3]
         self.check_background_command(command)
 
-    def check_background_command(self, command, expected_args=None):
+    def test_background_resume_prompts_and_preserves_the_exact_report_path(self):
+        section = README.read_text(encoding="utf-8").split("### Resume an interrupted scan", 1)[1]
+        command = re.findall(r"```bash\n(.*?)\n```", section, re.S)[2]
+        report = "/root/report with 'quote $(do-not-run) \\ backslash"
+        self.check_background_command(command, ["--resume", report], (report + "\n").encode())
+        for shell in ("/bin/bash", "/bin/sh"):
+            blank = subprocess.run([shell, "-c", command], input=b"\n", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertNotEqual(blank.returncode, 0)
+            self.assertNotIn(b"Background job:", blank.stdout)
+
+    def check_background_command(self, command, expected_args=None, prompt_input=None):
         # A harmless Python fixture replaces the scanner; no host scan or callback runs.
         with tempfile.TemporaryDirectory(prefix="triage-background-test-") as directory:
             root = Path(directory) / "account space"
@@ -163,9 +173,9 @@ class BackgroundTests(unittest.TestCase):
                         # Flattening simulates pasting a multiline command as one line.
                         launch = subprocess.Popen([shell, "-c", " ".join(command.splitlines())],
                                                   env=dict(environment, FIXTURE_EXIT=str(exit_code)),
-                                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                                  stdin=subprocess.PIPE if prompt_input is not None else subprocess.DEVNULL, stdout=subprocess.PIPE,
                                                   stderr=subprocess.PIPE, start_new_session=True)
-                        output, errors = launch.communicate(timeout=5)
+                        output, errors = launch.communicate(input=prompt_input, timeout=5)
                         self.assertEqual(launch.returncode, 0, errors.decode())
                         job = Path(re.search(rb"Background job: (.+)", output).group(1).decode())
                         self.assertNotIn(job, jobs)
