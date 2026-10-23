@@ -4,6 +4,10 @@ A standalone, read-only triage script for **RunCloud on Ubuntu 18.04 and newer**
 
 **It requires Python 3.6 or newer. It does not require, execute, upgrade, or modify PHP.** It uses only Python's standard library and does not install Python packages. By default it makes no network requests or uploads. Optional `--notify-url` sends a small JSON result summary to an endpoint you choose; add `--notify-findings` to include every saved finding's path and review metadata.
 
+**Laravel is not required.** The same commands and general PHP file/log checks apply to Laravel, WordPress, Symfony, other PHP CMS/frameworks, and custom or plain PHP applications on RunCloud. The scanner reads files and logs directly, without booting the application or running Artisan, Composer or WP-CLI. A server can host a mixture of these applications.
+
+Some additional heuristics recognize paths such as Laravel's `storage/` and WordPress's `wp-content/uploads/`. Those path-specific checks do not restrict the general scan to either framework. These are triage indicators, not a complete audit of application logic, CMS plugins or databases. For deployments outside the usual RunCloud directories, specify the real paths with `--home`, `--extra-root` or `--log-root`; see [coverage and custom layouts](#7-coverage-and-largercustom-servers).
+
 This is a first-pass investigation tool for the PHP vulnerabilities announced on 21 October 2026 and for common signs of persistent compromise. **It cannot certify that a server is clean, identify every attack, or prove that a finding was caused by PHP2Shell.** A successful attack may leave no files or retained logs. File timestamps alone cannot establish whether compromise happened before patching.
 
 ## 1. Get the scanner from GitHub
