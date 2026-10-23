@@ -413,12 +413,16 @@ This adds the following fields to the summary payload (example with one finding)
 ```
 
 - `findings` includes **every saved HIGH, REVIEW and INFO finding**, in scan order, rather than the first 40 shown in the summary. One file can have several entries for different rules. The quarantine menu groups files separately; JSON array indexes are not quarantine selection numbers.
-- Each entry includes its `path`, `site`, `severity`, `rule`, `reason`, and `kind` (`file` or `log`). Where recorded, it also includes `line`, `byte_offset`, `line_or_chunk`, `sha256`, `content_complete`, `mtime_utc`, and `ctime_utc`. A partial file read has `sha256: null`; full and prefix hashes with sizes remain available in the local `files.jsonl` inventory.
+- Each entry includes its `path`, `site`, `severity`, `rule`, `reason`, and `kind` (`file`, `log`, or the optional `runtime`/`network` evidence types). Where recorded, it also includes `line`, `byte_offset`, `line_or_chunk`, `sha256`, `content_complete`, `mtime_utc`, `ctime_utc`, and `birthtime_utc`. A partial file read has `sha256: null`; full and prefix hashes with sizes remain available in the local `files.jsonl` inventory.
 - `findings_count` is the array length. `findings_omitted` counts detected matches absent from the array, normally repeated log matches beyond `--log-samples`. The existing `indicators` totals still count those matches. This option does not increase scan/read/sample limits. An incomplete scan can also send the findings saved so far; check `scan_finished`, `report_finalized`, and coverage gaps even if `findings_omitted` is zero.
 - Raw file contents, log excerpts, arbitrary evidence fields, and the notification token are excluded from the JSON body. Paths and site names are included, so use a trusted receiver and protect its stored results. Escape these values when displaying them in a web interface.
 - The list is retained in memory only when this option is enabled, and is sent in one POST without an additional findings cap. For large reports, account for memory use, the receiver/proxy request-body limit, and `--notify-timeout`. HTTP 413 or another delivery failure does not silently trim the list or change the local report or scan exit code.
 
 The callback runs **before the interactive quarantine prompt**. It reports scan findings, not subsequent quarantine actions, and cannot choose files or trigger quarantine remotely. A scan already running will keep its original notification behavior; use the updated script and flag on the next run.
+
+**File dates:** `mtime_utc` is the last content modification time; Linux `ctime_utc` is the last inode status change (including changes to content, permissions or ownership), **not creation time**. Since 1.8.0, `birthtime_utc` records filesystem creation time where Linux `statx` exposes it; otherwise it is `null`. The lookup uses the same safely opened file descriptor, without running shell commands or following symlinks. Python 3.6 remains supported; older libc on native x86-64/ARM64 can use the Linux syscall directly, while unsupported kernels, filesystems or platforms leave the date unavailable. These values describe the file at scan time and do not establish the original authoring date or the time of compromise. [Linux statx documentation](https://man7.org/linux/man-pages/man2/statx.2.html)
+
+The dates are retained in file inventories and saved file findings, and in log inventories/findings from 1.8.0. A log's dates belong to the log file, not individual events. Streambrain displays the three dates in UTC and lets you choose a date field with inclusive From/To days. Date filtering also applies to summaries, tabs, pagination and bulk clearing/restoring. Missing/invalid dates and non-file evidence are excluded only when a range is active; old reports keep their existing modification/change dates and show creation as unavailable. Updating the scanner does not backfill older reports.
 
 In your project, accept a POST with `Content-Type: application/json; charset=utf-8`, validate the bearer token if configured, store the result, and return a **2xx** response promptly. `hostname` and `run_id` identify the server and local report folder. The response body is ignored.
 
@@ -571,6 +575,14 @@ If the SSH session closed, or you want to decide later, use the report folder th
 ```bash
 /usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --quarantine /root/runcloud-triage-SERVER-20261022T120000Z-a1b2c3d4
 ```
+
+**Limit quarantine to one webapp (scanner 1.8.0+):** use the saved report and the webapp's absolute directory:
+
+```bash
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --quarantine /root/runcloud-triage-SERVER-20261022T120000Z-a1b2c3d4 --quarantine-root /home/USER/webapps/APP
+```
+
+Only HIGH file candidates inside that directory and its subdirectories are listed. Add `--include-review` to include its REVIEW files. Selection numbers and `a` apply only to this filtered list; neighbouring apps, including similarly named directories, cannot be selected. You still select and confirm files, and the existing hash and symlink checks still apply. No scan is repeated and nothing is moved automatically. You can also add `--quarantine-root` to a scan/background command to constrain its later quarantine selection; the printed reopening command preserves it. This option does not reduce scan coverage, and it is not used with restore/purge. `--home` controls scan coverage, not quarantine selection.
 
 To put quarantined files back, or to delete quarantined copies for good:
 

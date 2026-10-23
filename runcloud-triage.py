@@ -15,6 +15,7 @@ import collections
 from contextlib import ExitStack, contextmanager
 import datetime as dt
 import errno
+import functools
 import gzip
 import hashlib
 import http.client
@@ -30,6 +31,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -37,7 +39,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.7.2"
+VERSION = "1.8.0"
 MIB = 1024 * 1024
 # Not named runcloud-triage-* so it is never mistaken for (or globbed with) a report folder.
 QUARANTINE_DIR = "/root/runcloud-quarantine"
@@ -189,6 +191,59 @@ def metadata(path, st):
     return {"path": path, "size": st.st_size, "uid": st.st_uid, "gid": st.st_gid,
             "mode": oct(stat.S_IMODE(st.st_mode)), "mtime_utc": utc(st.st_mtime),
             "ctime_utc": utc(st.st_ctime), "device": st.st_dev, "inode": st.st_ino}
+
+
+@functools.lru_cache(maxsize=1)
+def birthtime_reader():
+    """Optional Linux statx reader. Never open another path or substitute ctime."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        call = getattr(libc, "statx", None)
+        syscall_number = None
+        if call is None:
+            # Ubuntu 18.04's libc predates statx(). Limit the raw syscall fallback
+            # to known native 64-bit Linux ABIs; unsupported systems return null.
+            if ctypes.sizeof(ctypes.c_void_p) != 8:
+                return None
+            syscall_number = {"x86_64": 332, "aarch64": 291}.get(os.uname().machine)
+            if syscall_number is None:
+                return None
+            call = libc.syscall
+            call.restype = ctypes.c_long
+        else:
+            call.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p]
+            call.restype = ctypes.c_int
+    except (ImportError, AttributeError, OSError):
+        return None
+
+    def read(fd):
+        # Linux UAPI statx is 256 bytes: mask at 0, btime (s64 sec/u32 nsec) at 80.
+        # Only request STATX_BTIME, using the already link-free-opened descriptor.
+        # AT_EMPTY_PATH | AT_STATX_DONT_SYNC avoids path lookup and forced writeback.
+        buffer = ctypes.create_string_buffer(256)
+        args = [ctypes.c_int(fd), ctypes.c_char_p(b""), ctypes.c_int(0x5000),
+                ctypes.c_uint(0x800), ctypes.byref(buffer)]
+        result = call(*([ctypes.c_long(syscall_number)] + args if syscall_number is not None else args))
+        if result != 0 or not struct.unpack_from("=I", buffer, 0)[0] & 0x800:
+            return None
+        seconds, nanoseconds = struct.unpack_from("=qI", buffer, 80)
+        if nanoseconds >= 1000000000:
+            return None
+        return utc(seconds)
+
+    return read
+
+
+def file_birthtime(fd):
+    """UTC filesystem creation time, or None when unavailable; never a scan error."""
+    try:
+        reader = birthtime_reader()
+        return reader(fd) if reader is not None else None
+    except (OSError, ValueError, OverflowError):
+        return None
 
 
 def readable_php_tag(data):
@@ -368,7 +423,7 @@ class Report:
                 # Explicit fields only: never upload log excerpts or arbitrary evidence.
                 finding = {key: row[key] for key in (
                     "path", "site", "severity", "rule", "reason", "line", "byte_offset",
-                    "line_or_chunk", "sha256", "content_complete", "mtime_utc", "ctime_utc",
+                    "line_or_chunk", "sha256", "content_complete", "mtime_utc", "ctime_utc", "birthtime_utc",
                     "expected_sha256", "package", "version", "source", "sensor_rule",
                     "event_utc", "source_ip", "destination_ip", "source_port", "destination_port",
                     "sensor_event_id", "assessment", "fixed_version", "serving_runtime_verified", "role"
@@ -560,10 +615,12 @@ def walk_files(root, report, record=True):
         gap(root, "root_unavailable", exc)
 
 
-def read_prefix(path, limit, report):
+def read_prefix(path, limit, report, file_times=None):
     handle, noatime = open_regular(path)
     with handle:
         before = os.fstat(handle.fileno())
+        if file_times is not None:
+            file_times["birthtime_utc"] = file_birthtime(handle.fileno())
         data = handle.read(limit + 1)
         after = os.fstat(handle.fileno())
     if not noatime:
@@ -579,8 +636,10 @@ def scan_file(path, report, persistence=False, config=False):
     site = report.site(path)
     report.sites[site]["files"] += 1
     try:
-        data, st, partial = read_prefix(path, report.args.max_file_mib * MIB, report)
+        file_times = {}
+        data, st, partial = read_prefix(path, report.args.max_file_mib * MIB, report, file_times=file_times)
         row = metadata(path, st)
+        row.update(file_times)
         digest = hashlib.sha256(data).hexdigest()
         row.update(site=site, bytes_read=len(data), content_complete=not partial,
                    sha256=digest if not partial else None, prefix_sha256=digest if partial else None)
@@ -614,7 +673,7 @@ def scan_file(path, report, persistence=False, config=False):
             report.emit("recent-files", row)
         for item in items:
             report.finding(path, dict(item, sha256=row["sha256"], content_complete=not partial,
-                                      mtime_utc=row["mtime_utc"], ctime_utc=row["ctime_utc"]))
+                                      mtime_utc=row["mtime_utc"], ctime_utc=row["ctime_utc"], birthtime_utc=row["birthtime_utc"]))
         if persistence or Path(path).name in PERSISTENCE_NAMES or "/.config/systemd/user/" in path:
             record = dict(row)
             # Inventory command-bearing persistence text for human review. Never copy
@@ -660,6 +719,8 @@ def scan_log(path, report):
         with raw:
             before = os.fstat(raw.fileno())
             # Stream compressed logs only; no extraction or paths from archive metadata.
+            log_dates = {"mtime_utc": utc(before.st_mtime), "ctime_utc": utc(before.st_ctime),
+                         "birthtime_utc": file_birthtime(raw.fileno())}
             suffix = path.lower()
             stream = (gzip.GzipFile(fileobj=raw) if suffix.endswith(".gz") else
                       bz2.BZ2File(raw) if suffix.endswith(".bz2") else
@@ -679,7 +740,7 @@ def scan_log(path, report):
                         save = sample_count < report.args.log_samples
                         report.finding(path, dict(event, line_or_chunk=line_number,
                                                   excerpt=line[:1200].decode("utf-8", "replace"),
-                                                  excerpt_truncated=len(line) > 1200), save=save)
+                                                  excerpt_truncated=len(line) > 1200, **log_dates), save=save)
                         if save:
                             sample_count += 1
                     if access:
@@ -707,6 +768,7 @@ def scan_log(path, report):
         if event_counts["traffic_keys_over_limit"]:
             report.gap(path, "traffic_aggregation_limit", event_counts["traffic_keys_over_limit"])
         report.emit("logs", dict(metadata(path, before), bytes_inspected=consumed,
+                                  birthtime_utc=log_dates["birthtime_utc"],
                                   lines_or_chunks=line_number, content_complete=not capped,
                                   indicator_counts=dict(event_counts), first_access_time=first_time,
                                   last_access_time=last_time, evidence_samples=sample_count))
@@ -1214,6 +1276,8 @@ def parser():
                          help="No scan: choose quarantined files and permanently delete them")
     p.add_argument("--include-review", action="store_true",
                    help="Also list REVIEW files in the post-scan or --quarantine selection (default: HIGH only); reports, callbacks and scan exit codes always include REVIEW")
+    p.add_argument("--quarantine-root", metavar="DIR",
+                   help="Limit the post-scan or --quarantine file selection to this absolute directory and its children; does not change scan scope")
     p.add_argument("--quarantine-dir", default=QUARANTINE_DIR,
                    help="Root-only quarantine folder outside scanned trees (default " + QUARANTINE_DIR + ")")
     return p
@@ -1241,6 +1305,12 @@ def parse_options(argv=None):
         argument_parser.error("Optional PHP assessment and sensor imports apply only to scans")
     if args.include_review and (args.restore or args.purge):
         argument_parser.error("--include-review applies to the post-scan or --quarantine selection, not --restore/--purge")
+    if args.quarantine_root:
+        if args.restore or args.purge:
+            argument_parser.error("--quarantine-root applies to the post-scan or --quarantine selection, not --restore/--purge")
+        if not os.path.isabs(args.quarantine_root):
+            argument_parser.error("--quarantine-root must be an absolute directory path")
+        args.quarantine_root = os.path.abspath(args.quarantine_root)
     args.zeek_notice = list(dict.fromkeys(os.path.abspath(path) for path in args.zeek_notice))
     args.suricata_eve = list(dict.fromkeys(os.path.abspath(path) for path in args.suricata_eve))
     if set(args.zeek_notice) & set(args.suricata_eve):
@@ -1471,7 +1541,7 @@ def remove_item(quarantine_fd, item_id):
     os.rmdir(item_id, dir_fd=quarantine_fd)
 
 
-def quarantine_candidates(report_dir, high_only=False):
+def quarantine_candidates(report_dir, high_only=False, quarantine_root=None):
     """File findings of a finished report: one entry per file, optionally HIGH only."""
     dfd = private_directory(report_dir)
     try:
@@ -1480,6 +1550,8 @@ def quarantine_candidates(report_dir, high_only=False):
             # Log evidence (rows with an excerpt) points at a log, not at a file to contain.
             if (row.get("severity") not in SEVERITY_ORDER or "excerpt" in row
                     or row.get("kind", "file") != "file" or not isinstance(row.get("path"), str)):
+                continue
+            if quarantine_root and not inside(os.path.abspath(row["path"]), quarantine_root):
                 continue
             entry = flagged.setdefault(row["path"], {"path": row["path"], "severity": row["severity"], "rules": []})
             if SEVERITY_ORDER[row["severity"]] < SEVERITY_ORDER[entry["severity"]]:
@@ -1724,13 +1796,16 @@ def confirm_and_apply(items, ask, describe, verb, question, accepted, action):
     return 0
 
 
-def offer_quarantine(report_dir, quarantine_dir, ask=input, candidates=None, include_review=False):
+def offer_quarantine(report_dir, quarantine_dir, ask=input, candidates=None, include_review=False, quarantine_root=None):
     try:
         if candidates is None:
-            candidates = quarantine_candidates(report_dir, high_only=not include_review)
+            candidates = quarantine_candidates(report_dir, high_only=not include_review, quarantine_root=quarantine_root)
     except (OSError, ValueError) as exc:
         print("Cannot read report " + report_dir + ": " + str(exc), file=sys.stderr)
         return 2
+    if quarantine_root:
+        candidates = [candidate for candidate in candidates if inside(os.path.abspath(candidate["path"]), quarantine_root)]
+        print("Quarantine selection limited to: " + quarantine_root)
     if not include_review:
         candidates = [candidate for candidate in candidates if candidate["severity"] == "HIGH"]
         print("Showing HIGH files only. REVIEW files remain in the report; add --include-review to list them too.")
@@ -1779,21 +1854,27 @@ def offer_after_scan(report_dir, args, ask=input):
     if args.user_mode:
         return
     try:
-        candidates = quarantine_candidates(report_dir, high_only=not args.include_review)
+        candidates = quarantine_candidates(report_dir, high_only=not args.include_review, quarantine_root=args.quarantine_root)
     except (OSError, ValueError):
         return
     if not candidates:
+        if args.quarantine_root:
+            print("No eligible file findings inside " + args.quarantine_root + ". Other webapps are excluded.", flush=True)
+            return
         if not args.include_review:
             print("No HIGH file findings to quarantine. REVIEW findings, if any, remain in the report; add --include-review to list them too.", flush=True)
         return
     command = "/usr/bin/python3 -I " + shlex.quote(os.path.abspath(__file__)) + " --quarantine " + shlex.quote(report_dir)
     if args.include_review:
         command += " --include-review"
+    if args.quarantine_root:
+        command += " --quarantine-root " + shlex.quote(args.quarantine_root)
     if os.path.abspath(args.quarantine_dir) != QUARANTINE_DIR:
         command += " --quarantine-dir " + shlex.quote(args.quarantine_dir)
     print(f"\n{len(candidates)} flagged file(s) can be quarantined now or later, without scanning again:\n  {command}", flush=True)
     if interactive_terminal():
-        offer_quarantine(report_dir, args.quarantine_dir, ask, candidates, include_review=args.include_review)
+        offer_quarantine(report_dir, args.quarantine_dir, ask, candidates, include_review=args.include_review,
+                         quarantine_root=args.quarantine_root)
 
 
 def run_quarantine_action(args, ask=input):
@@ -1807,7 +1888,8 @@ def run_quarantine_action(args, ask=input):
     os.umask(0o077)
     quarantine_dir = os.path.abspath(args.quarantine_dir)
     if args.quarantine:
-        return offer_quarantine(os.path.abspath(args.quarantine), quarantine_dir, ask, include_review=args.include_review)
+        return offer_quarantine(os.path.abspath(args.quarantine), quarantine_dir, ask, include_review=args.include_review,
+                                quarantine_root=args.quarantine_root)
     if args.restore:
         return offer_restore(quarantine_dir, ask)
     return offer_purge(quarantine_dir, ask)

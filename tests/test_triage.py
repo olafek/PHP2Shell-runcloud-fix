@@ -354,6 +354,7 @@ class NotificationTests(unittest.TestCase):
                         "reason": "Inspect the fixture without executing it.", "line": index + 1,
                         "byte_offset": index, "sha256": "a" * 64, "content_complete": True,
                         "mtime_utc": "2026-10-22T12:00:00+00:00", "ctime_utc": "2026-10-22T12:00:00+00:00",
+                        "birthtime_utc": "2020-01-01T00:00:00+00:00",
                         "review_text": "private-file-content", "unexpected_field": "private-extra-evidence",
                     })
                 log = {"severity": "INFO", "rule": "php_fatal_or_timeout", "reason": "Log indicator only.",
@@ -381,6 +382,9 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(len(report.preview), 40)
         first = delivered["findings"][0]
         self.assertEqual(first["kind"], "file")
+        self.assertEqual(first["birthtime_utc"], "2020-01-01T00:00:00+00:00")
+        self.assertEqual(first["mtime_utc"], "2026-10-22T12:00:00+00:00")
+        self.assertEqual(first["ctime_utc"], "2026-10-22T12:00:00+00:00")
         self.assertEqual(first["site"], "/home/user/webapps/site")
         self.assertEqual(first["reason"], "Inspect the fixture without executing it.")
         self.assertEqual(first["line"], 1)
@@ -470,6 +474,67 @@ class LinuxFixtureTests(unittest.TestCase):
         with mock.patch.object(triage, "open_regular", side_effect=PermissionError("fixture")):
             triage.scan_file(str(path), self.report)
         self.assertEqual(self.report.gaps["file_read_error"], 1)
+
+    def test_file_dates_are_recorded_and_sent_without_substituting_ctime_for_birthtime(self):
+        self.args.notify_findings = True
+        self.report.notification_findings = []
+        path = self.write("dates.php", request_sample())
+        os.utime(str(path), (1000000000, 1000000000))
+        with mock.patch.object(triage, "file_birthtime", return_value="2000-01-01T00:00:00+00:00"):
+            triage.scan_file(str(path), self.report)
+        self.assertEqual(self.rows("files")[0]["birthtime_utc"], "2000-01-01T00:00:00+00:00")
+        finding = self.report.notification_findings[0]
+        self.assertEqual(finding["mtime_utc"], triage.utc(1000000000))
+        self.assertEqual(finding["birthtime_utc"], "2000-01-01T00:00:00+00:00")
+        self.assertNotEqual(finding["birthtime_utc"], finding["ctime_utc"])
+        with mock.patch.object(triage, "birthtime_reader", return_value=None):
+            triage.scan_file(str(path), self.report)
+        self.assertIsNone(self.report.notification_findings[-1]["birthtime_utc"])
+        self.assertNotIn("file_read_error", self.report.gaps)
+
+    def test_birthtime_uses_open_descriptor_even_if_the_name_is_replaced(self):
+        path = self.write("birthtime.txt", b"original")
+        with path.open("rb") as handle:
+            first = triage.file_birthtime(handle.fileno())
+            if first is None:
+                self.skipTest("Filesystem/kernel/libc does not expose birth time")
+            self.assertLessEqual(abs(triage.parse_time(first).timestamp() - time.time()), 5)
+            path.unlink()
+            path.symlink_to(self.out, target_is_directory=True)
+            self.assertEqual(triage.file_birthtime(handle.fileno()), first)
+        with mock.patch.object(triage, "birthtime_reader", return_value=mock.Mock(side_effect=OSError(errno.ENOSYS, "fixture"))):
+            self.assertIsNone(triage.file_birthtime(-1))
+
+    def test_log_findings_send_the_log_file_dates_without_using_event_times(self):
+        path = self.write("error.log", b"2020-01-01 PHP Fatal error: fixture\n")
+        self.report.notification_findings = []
+        os.utime(str(path), (1000000000, 1000000000))
+        with mock.patch.object(triage, "file_birthtime", return_value="2000-01-01T00:00:00+00:00"):
+            triage.scan_log(str(path), self.report)
+        [finding] = self.report.notification_findings
+        self.assertEqual(finding["kind"], "log")
+        self.assertEqual(finding["mtime_utc"], triage.utc(1000000000))
+        self.assertEqual(finding["birthtime_utc"], "2000-01-01T00:00:00+00:00")
+        self.assertNotIn("excerpt", finding)
+
+    def test_birthtime_raw_syscall_fallback_for_older_libc_matches_native_result(self):
+        try:
+            import ctypes
+            from types import SimpleNamespace
+        except ImportError:
+            self.skipTest("ctypes is unavailable")
+        if ctypes.sizeof(ctypes.c_void_p) != 8 or os.uname().machine not in ("x86_64", "aarch64"):
+            self.skipTest("Raw fallback only targets known native 64-bit ABIs")
+        path = self.write("birthtime-fallback.txt", b"fixture")
+        libc = ctypes.CDLL(None, use_errno=True)
+        self.addCleanup(triage.birthtime_reader.cache_clear)
+        with path.open("rb") as handle:
+            expected = triage.file_birthtime(handle.fileno())
+            if expected is None:
+                self.skipTest("Filesystem/kernel does not expose birth time")
+            triage.birthtime_reader.cache_clear()
+            with mock.patch.object(ctypes, "CDLL", return_value=SimpleNamespace(syscall=libc.syscall)):
+                self.assertEqual(triage.file_birthtime(handle.fileno()), expected)
 
     def test_traversal_avoids_python37_scandir_fd(self):
         self.write("alice/webapps/site/hello.txt", b"hello")
@@ -993,6 +1058,15 @@ class SelectionTests(unittest.TestCase):
 
 
 class QuarantineOptionTests(unittest.TestCase):
+    def test_quarantine_root_requires_an_absolute_path_and_only_applies_to_selection(self):
+        root = os.path.abspath("selected-app")
+        self.assertEqual(triage.parse_options(["--quarantine-root", root]).quarantine_root, root)
+        with contextlib.redirect_stderr(io.StringIO()):
+            for args in (["--quarantine-root", "relative"], ["--restore", "--quarantine-root", root],
+                         ["--purge", "--quarantine-root", root]):
+                with self.assertRaises(SystemExit):
+                    triage.parse_options(args)
+
     def test_review_is_opt_in_for_scans_and_reopening_quarantine(self):
         self.assertFalse(triage.parse_options([]).include_review)
         self.assertTrue(triage.parse_options(["--include-review"]).include_review)
@@ -1230,6 +1304,42 @@ class QuarantineTests(unittest.TestCase):
         self.assertFalse(shell.exists())
         self.assertTrue(upload.exists())
         self.assertIn(str(upload), out.getvalue())
+
+    def test_quarantine_root_confines_all_selection_to_one_webapp_and_children(self):
+        selected = self.write("k2shop/webapps/airline-bags-shop/nested/shell.php", request_sample())
+        neighbour = self.write("k2shop/webapps/airline-bags-shop-old/shell.php", request_sample())
+        other = self.write("other/webapps/airline-bags-shop/shell.php", request_sample())
+        review = self.write("k2shop/webapps/airline-bags-shop/uploads/review.php", sample(b"echo 1;"))
+        self.scan(selected, neighbour, other, review)
+        root = str(self.home / "k2shop/webapps/airline-bags-shop")
+        args = triage.parse_options(["--quarantine", str(self.report_dir), "--quarantine-root", root + "/"])
+        args.quarantine_dir = self.qdir
+        with mock.patch.object(triage, "interactive_terminal", return_value=True), contextlib.redirect_stdout(io.StringIO()) as out:
+            code = triage.run_quarantine_action(args, ask=self.answers("2", "a", "y"))
+        self.assertEqual(code, 0)
+        self.assertFalse(selected.exists())
+        self.assertTrue(neighbour.exists() and other.exists() and review.exists())
+        self.assertNotIn(str(neighbour), out.getvalue())
+        self.assertNotIn(str(other), out.getvalue())
+        self.assertIn("Choose", out.getvalue())
+        self.assertEqual({c["path"] for c in triage.quarantine_candidates(str(self.report_dir), quarantine_root=root)},
+                         {str(review), str(selected)})
+
+    def test_quarantine_root_keeps_scope_in_reopen_command_and_handles_no_matches(self):
+        shell, upload = self.shell_and_upload()
+        self.scan(shell, upload)
+        self.args.user_mode = False
+        self.args.quarantine_root = str(shell.parent)
+        self.args.include_review = True
+        with mock.patch.object(triage, "interactive_terminal", return_value=False), contextlib.redirect_stdout(io.StringIO()) as out:
+            triage.offer_after_scan(str(self.report_dir), self.args)
+        self.assertIn("--quarantine-root " + self.args.quarantine_root, out.getvalue())
+        self.assertIn("--include-review", out.getvalue())
+        self.args.quarantine_root = str(self.home / "no-matches")
+        with mock.patch.object(triage, "interactive_terminal", return_value=True), contextlib.redirect_stdout(io.StringIO()) as out:
+            triage.offer_after_scan(str(self.report_dir), self.args, ask=mock.Mock(side_effect=AssertionError("No prompt")))
+        self.assertIn("No eligible file findings", out.getvalue())
+        self.assertTrue(shell.exists() and upload.exists())
 
     def test_high_only_groups_mixed_severities_before_filtering(self):
         mixed = self.write("alice/webapps/site/wp-content/uploads/mixed.jpg", request_sample())
