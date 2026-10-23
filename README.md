@@ -672,15 +672,15 @@ python3 -m py_compile runcloud-triage.py
 
 Linux filesystem fixtures test symlink/FIFO handling, age-independent coverage, report generation, compressed logs, limits and read failures. `tests/test_setup.py` checks the README commands in Bash and `/bin/sh` with offline download fixtures, including pasted command boundaries, private permissions, failed downloads and checksum mismatches. Its background fixture verifies that jobs continue after the launching shell exits and a hangup signal arrives, detach all terminal streams, and save exit codes 0/1/2. Run the tests as root in a disposable Linux environment. Detection and timestamp tests can also run on Windows; Linux-specific tests are skipped there. Python 3.6 grammar is checked on interpreters that provide AST grammar selection.
 
-Version 1.7.2 validation includes entries disappearing during traversal, continued scanning of session directories, missing roots and permission/I/O failures, and their distinct callback statuses and exit codes. It also covers the default HIGH-only quarantine list, opting in to REVIEW files, selection numbers, reopening reports, and unchanged REVIEW reporting/callbacks/exit codes. The suite retains optional package assessment, Zeek JSON/TSV and Suricata imports, malformed and oversized records, byte/sample limits, callback privacy, exclusion of runtime/network findings from quarantine, the Symfony documentation regression, trusted vendor baseline comparisons, complete CLI runs as root and an ordinary account in isolated filesystems, binary PHP-tag heuristics, report permissions, counting/ETA, callback failures, background hangup handling, setup commands with spaces in home paths, and the existing quarantine safeguards. Notification transport tests use a local HTTP receiver and do not contact external services.
+Version 1.8.0 validation includes file/log timestamps in reports and callbacks, optional birth time through both libc and the older-libc syscall fallback, unavailable creation times, and quarantine restricted to one webapp without selecting neighbouring paths. The suite retains checks for entries disappearing during traversal, session-directory scanning, permission/I/O failures, callback statuses and exit codes, HIGH-only/REVIEW selection, optional package assessment and sensor imports, callback privacy, the Symfony documentation regression, trusted vendor baselines, root/user CLI runs, binary PHP-tag heuristics, private permissions, counting/ETA, background hangup handling, setup commands with spaces in home paths, and quarantine safeguards. Notification transport tests use a local HTTP receiver and do not contact external services.
 
 Older-runtime validation used packages verified against signed Ubuntu archive metadata in isolated chroots under WSL:
 
 | Ubuntu userspace | Python | Test result |
 | --- | --- | --- |
-| 22.04 (WSL) | 3.10.12 | 110 passed |
-| 18.04 | 3.6.9 | 109 passed; 1 skipped (AST grammar selection needs Python 3.8+) |
-| 20.04 | 3.8.10 | 110 passed |
+| 22.04 (WSL) | 3.10.12 | 117 passed |
+| 18.04 | 3.6.9 | 116 passed; 1 skipped (AST grammar selection needs Python 3.8+) |
+| 20.04 | 3.8.10 | 117 passed |
 
 Both also passed isolated `--help` and Bash/`/bin/sh` setup checks. Ubuntu's curl 7.58.0 and 7.68.0 accept the download options used here. This validates the older userspace and Python APIs; each server's RunCloud configuration, kernel and external HTTPS endpoint still need on-host validation.
 
