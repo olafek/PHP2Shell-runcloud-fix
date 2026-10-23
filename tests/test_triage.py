@@ -787,6 +787,18 @@ class LinuxFixtureTests(unittest.TestCase):
         notify_args = ["--notify-url", "http://example.test/hook?private=url", "--notify-findings"]
         notified_clean = subprocess.run([sys.executable, "-c", code, str(jail)] + notify_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(notified_clean.returncode, 0)
+        upload = jail / "home/user/webapps/site/wp-content/uploads/review.php"
+        upload.parent.mkdir(parents=True)
+        upload.write_bytes(sample(b"echo 1;"))
+        high_only_review = subprocess.run([sys.executable, "-c", code, str(jail), "--high-only"] + notify_args,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(high_only_review.returncode, 1, high_only_review.stdout.decode() + high_only_review.stderr.decode())
+        self.assertIn(b"No HIGH file findings to quarantine", high_only_review.stdout)
+        self.assertNotIn(b"--quarantine", high_only_review.stdout)
+        filtered_report = re.search(rb"Writing private report to: (\S+)", high_only_review.stdout).group(1).decode()
+        saved = json.loads((jail / filtered_report.lstrip("/") / "findings.jsonl").read_text())
+        self.assertEqual(saved["severity"], "REVIEW")
+        upload.unlink()
         (jail / "home/user/webapps/site/example.jpg").write_bytes(request_sample())
         review = subprocess.run([sys.executable, "-c", code, str(jail)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(review.returncode, 1, review.stdout.decode() + review.stderr.decode())
@@ -812,6 +824,7 @@ class LinuxFixtureTests(unittest.TestCase):
         notified_interrupted = subprocess.run([sys.executable, "-c", interrupted_code, str(jail)] + notify_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(notified_interrupted.returncode, 2)
         for result, status, finalized in ((notified_clean, "completed", True), (notified_review, "review_required", True),
+                                          (high_only_review, "review_required", True),
                                           (notified_incomplete, "incomplete", True), (notified_init, "incomplete", False),
                                           (notified_interrupted, "incomplete", True)):
             callbacks = [json.loads(line[len("CALLBACK "):]) for line in result.stdout.decode().splitlines() if line.startswith("CALLBACK ")]
@@ -828,8 +841,11 @@ class LinuxFixtureTests(unittest.TestCase):
                                     for row in payload["findings"]))
             if result in (notified_clean, notified_init, notified_interrupted):
                 self.assertEqual(payload["findings"], [])
+            if result is high_only_review:
+                self.assertEqual(payload["indicators"]["REVIEW"], 1)
+                self.assertEqual(payload["findings"][0]["severity"], "REVIEW")
         reports = list((jail / "root").glob("runcloud-triage-*"))
-        self.assertEqual(len(reports), 8)
+        self.assertEqual(len(reports), 9)
         for report in reports:
             self.assertEqual(stat.S_IMODE(report.stat().st_mode), 0o700)
             for artifact in report.iterdir():
@@ -854,6 +870,15 @@ class SelectionTests(unittest.TestCase):
 
 
 class QuarantineOptionTests(unittest.TestCase):
+    def test_high_only_is_opt_in_for_scans_and_reopening_quarantine(self):
+        self.assertFalse(triage.parse_options([]).high_only)
+        self.assertTrue(triage.parse_options(["--high-only"]).high_only)
+        self.assertTrue(triage.parse_options(["--quarantine", "/root/report", "--high-only"]).high_only)
+        with contextlib.redirect_stderr(io.StringIO()):
+            for action in ("--restore", "--purge"):
+                with self.assertRaises(SystemExit):
+                    triage.parse_options([action, "--high-only"])
+
     def test_actions_are_exclusive_and_do_not_take_notification_options(self):
         with contextlib.redirect_stderr(io.StringIO()):
             for argv in (["--quarantine", "/root/r", "--restore"], ["--restore", "--purge"],
@@ -1082,6 +1107,60 @@ class QuarantineTests(unittest.TestCase):
         self.assertFalse(shell.exists())
         self.assertTrue(upload.exists())
         self.assertIn(str(upload), out.getvalue())
+
+    def test_high_only_groups_mixed_severities_before_filtering(self):
+        mixed = self.write("alice/webapps/site/wp-content/uploads/mixed.jpg", request_sample())
+        review = self.write("alice/webapps/site/wp-content/uploads/review.php", sample(b"echo 1;"))
+        self.scan(review, mixed)
+        [candidate] = triage.quarantine_candidates(str(self.report_dir), high_only=True)
+        self.assertEqual(candidate["path"], str(mixed))
+        self.assertIn("request_to_execution", candidate["rules"])
+        self.assertIn("php_in_other_file_type", candidate["rules"])
+        self.assertTrue(candidate["scanned"]["sha256"])
+        self.assertEqual(len(triage.quarantine_candidates(str(self.report_dir))), 2)
+
+    def test_high_only_reopened_prompt_all_selects_only_displayed_high_files(self):
+        shell, upload = self.shell_and_upload()
+        self.scan(shell, upload)
+        args = triage.parse_options(["--quarantine", str(self.report_dir), "--high-only"])
+        # The temporary test quarantine is deliberately outside the scanned fixture home.
+        args.quarantine_dir = self.qdir
+        with mock.patch.object(triage, "interactive_terminal", return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = triage.run_quarantine_action(args, ask=self.answers("2", "a", "y"))
+        self.assertEqual(code, 0)
+        self.assertIn("Choose", out.getvalue())  # Hidden REVIEW files have no selection number.
+        self.assertIn(str(shell), out.getvalue())
+        self.assertNotIn(str(upload), out.getvalue())
+        self.assertFalse(shell.exists())
+        self.assertTrue(upload.exists())
+
+    def test_high_only_with_no_high_files_never_asks_for_selection(self):
+        upload = self.write("alice/webapps/site/wp-content/uploads/review.php", sample(b"echo 1;"))
+        self.scan(upload)
+        ask = mock.Mock(side_effect=AssertionError("No HIGH files should mean no prompt"))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = triage.offer_quarantine(str(self.report_dir), self.qdir, ask=ask, high_only=True)
+        self.assertEqual(code, 0)
+        self.assertIn("No HIGH file findings", out.getvalue())
+        self.assertNotIn(str(upload), out.getvalue())
+        ask.assert_not_called()
+        self.assertTrue(upload.exists())
+
+    def test_after_scan_preserves_high_only_in_prompt_and_background_reopen_command(self):
+        shell, upload = self.shell_and_upload()
+        self.scan(shell, upload)
+        self.args.high_only = True
+        self.args.user_mode = False
+        self.args.quarantine_dir = self.qdir
+        for interactive in (True, False):
+            with mock.patch.object(triage, "interactive_terminal", return_value=interactive), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                triage.offer_after_scan(str(self.report_dir), self.args, ask=self.answers(""))
+            self.assertIn("--high-only", out.getvalue())
+            self.assertIn("1 flagged file(s)", out.getvalue())
+            self.assertNotIn(str(upload), out.getvalue())
+        self.assertTrue(shell.exists() and upload.exists())
 
     def test_skipping_declining_or_closing_the_prompt_changes_nothing(self):
         shell, upload = self.shell_and_upload()

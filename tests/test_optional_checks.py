@@ -57,7 +57,7 @@ class OptionalRuleTests(unittest.TestCase):
             self.assertEqual(triage.php_version_assessment(prefix + str(fixed) + "RC1")[0], "unknown")
         for version in ("7.4.33", "7.4.99-vendor", "8.1.34", "5.6.40"):
             self.assertEqual(triage.php_version_assessment(version)[0], "legacy_requires_vendor_verification")
-        for version in ("8.6.0", "6.0.0", "5.3.29", "8.99.1", "8.2", "bad", "8.2.35\nsecret"):
+        for version in ("8.6.0", "6.0.0", "5.3.29", "8.99.1", "8.2", "bad", "8.2.35garbage", "8.2.35\nsecret"):
             self.assertEqual(triage.php_version_assessment(version)[0], "unknown")
 
     def test_only_installed_runtime_packages_are_assessed(self):
@@ -223,6 +223,23 @@ class OptionalFilesystemTests(unittest.TestCase):
         self.assertEqual(self.report.gaps["log_content_limit"], 1)
         triage.import_sensor_log(path, "suricata", self.report)
         self.assertEqual(self.report.gaps["total_log_budget_exhausted"], 1)
+
+    def test_exact_budget_eof_without_newline_is_a_complete_record(self):
+        self.args.max_log_mib = self.args.max_total_log_mib = 1
+        record = json.dumps(eve()).encode()
+        # Whitespace is legal before a JSON record and must not be confused with a cut record.
+        path = self.write("exact.json", b" " * (triage.MIB - len(record)) + record)
+        triage.import_sensor_log(path, "suricata", self.report)
+        self.assertEqual(self.report.counts["sensor_indicators"], 1)
+        self.assertNotIn("log_content_limit", self.report.gaps)
+        self.assertNotIn("sensor_records_invalid", self.report.gaps)
+
+    def test_non_file_kinds_never_enter_quarantine_even_with_a_hash(self):
+        for kind in ("runtime", "network"):
+            self.report.finding("/var/log/eve.json", {"kind": kind, "severity": "REVIEW", "rule": "fixture",
+                                                      "sha256": "a" * 64, "content_complete": True})
+        self.rows("findings")
+        self.assertEqual(triage.quarantine_candidates(str(self.out)), [])
 
     @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "Isolated CLI needs root to chroot and drop privileges")
     def test_cli_root_and_user_optional_checks_callbacks_and_failures(self):

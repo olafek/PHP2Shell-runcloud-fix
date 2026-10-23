@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 MIB = 1024 * 1024
 # Not named runcloud-triage-* so it is never mistaken for (or globbed with) a report folder.
 QUARANTINE_DIR = "/root/runcloud-quarantine"
@@ -1208,6 +1208,8 @@ def parser():
                          help="No scan: choose quarantined files and put them back exactly as they were")
     actions.add_argument("--purge", action="store_true",
                          help="No scan: choose quarantined files and permanently delete them")
+    p.add_argument("--high-only", action="store_true",
+                   help="Show only HIGH files in the post-scan or --quarantine selection; reports, callbacks and scan exit codes still include REVIEW")
     p.add_argument("--quarantine-dir", default=QUARANTINE_DIR,
                    help="Root-only quarantine folder outside scanned trees (default " + QUARANTINE_DIR + ")")
     return p
@@ -1233,6 +1235,8 @@ def parse_options(argv=None):
         argument_parser.error("--notify-url applies to scans, not to --quarantine/--restore/--purge")
     if (args.quarantine or args.restore or args.purge) and (args.assess_php or args.zeek_notice or args.suricata_eve):
         argument_parser.error("Optional PHP assessment and sensor imports apply only to scans")
+    if args.high_only and (args.restore or args.purge):
+        argument_parser.error("--high-only applies to the post-scan or --quarantine selection, not --restore/--purge")
     args.zeek_notice = list(dict.fromkeys(os.path.abspath(path) for path in args.zeek_notice))
     args.suricata_eve = list(dict.fromkeys(os.path.abspath(path) for path in args.suricata_eve))
     if set(args.zeek_notice) & set(args.suricata_eve):
@@ -1463,8 +1467,8 @@ def remove_item(quarantine_fd, item_id):
     os.rmdir(item_id, dir_fd=quarantine_fd)
 
 
-def quarantine_candidates(report_dir):
-    """HIGH/REVIEW file findings of a finished report: one entry per file, HIGH first."""
+def quarantine_candidates(report_dir, high_only=False):
+    """File findings of a finished report: one entry per file, optionally HIGH only."""
     dfd = private_directory(report_dir)
     try:
         flagged = collections.OrderedDict()
@@ -1478,6 +1482,9 @@ def quarantine_candidates(report_dir):
                 entry["severity"] = row["severity"]
             if row.get("rule") not in entry["rules"]:
                 entry["rules"].append(row.get("rule"))
+        if high_only:
+            flagged = collections.OrderedDict((path, entry) for path, entry in flagged.items()
+                                              if entry["severity"] == "HIGH")
         if flagged:
             # files.jsonl holds what the scan read: full hash, or prefix hash plus size for large files.
             for row in report_rows(dfd, "files.jsonl"):
@@ -1713,15 +1720,18 @@ def confirm_and_apply(items, ask, describe, verb, question, accepted, action):
     return 0
 
 
-def offer_quarantine(report_dir, quarantine_dir, ask=input, candidates=None):
+def offer_quarantine(report_dir, quarantine_dir, ask=input, candidates=None, high_only=False):
     try:
         if candidates is None:
-            candidates = quarantine_candidates(report_dir)
+            candidates = quarantine_candidates(report_dir, high_only=high_only)
     except (OSError, ValueError) as exc:
         print("Cannot read report " + report_dir + ": " + str(exc), file=sys.stderr)
         return 2
+    if high_only:
+        candidates = [candidate for candidate in candidates if candidate["severity"] == "HIGH"]
+        print("HIGH-only selection: REVIEW files remain in the report; omit --high-only to include them.")
     if not candidates:
-        print("No HIGH/REVIEW file findings to quarantine in " + report_dir + ".")
+        print("No " + ("HIGH" if high_only else "HIGH/REVIEW") + " file findings to quarantine in " + report_dir + ".")
         return 0
     print(f"\n{len(candidates)} flagged file(s). Quarantine moves a file out of its site into {quarantine_dir}, keeping an")
     print("exact copy for --restore. A site that loads the file may show errors until it is restored.")
@@ -1765,17 +1775,21 @@ def offer_after_scan(report_dir, args, ask=input):
     if args.user_mode:
         return
     try:
-        candidates = quarantine_candidates(report_dir)
+        candidates = quarantine_candidates(report_dir, high_only=args.high_only)
     except (OSError, ValueError):
         return
     if not candidates:
+        if args.high_only:
+            print("No HIGH file findings to quarantine. REVIEW findings, if any, remain in the report.", flush=True)
         return
     command = "/usr/bin/python3 -I " + shlex.quote(os.path.abspath(__file__)) + " --quarantine " + shlex.quote(report_dir)
+    if args.high_only:
+        command += " --high-only"
     if os.path.abspath(args.quarantine_dir) != QUARANTINE_DIR:
         command += " --quarantine-dir " + shlex.quote(args.quarantine_dir)
     print(f"\n{len(candidates)} flagged file(s) can be quarantined now or later, without scanning again:\n  {command}", flush=True)
     if interactive_terminal():
-        offer_quarantine(report_dir, args.quarantine_dir, ask, candidates)
+        offer_quarantine(report_dir, args.quarantine_dir, ask, candidates, high_only=args.high_only)
 
 
 def run_quarantine_action(args, ask=input):
@@ -1789,7 +1803,7 @@ def run_quarantine_action(args, ask=input):
     os.umask(0o077)
     quarantine_dir = os.path.abspath(args.quarantine_dir)
     if args.quarantine:
-        return offer_quarantine(os.path.abspath(args.quarantine), quarantine_dir, ask)
+        return offer_quarantine(os.path.abspath(args.quarantine), quarantine_dir, ask, high_only=args.high_only)
     if args.restore:
         return offer_restore(quarantine_dir, ask)
     return offer_purge(quarantine_dir, ask)

@@ -167,6 +167,8 @@ Use the printed **report** directory, not the background-log folder:
 
 This reads the saved findings and opens the interactive selection/confirmation prompt without rescanning. Nothing moves until you choose files and confirm. No candidates means there is nothing to select. Review dependency files against their release before quarantining them.
 
+Add `--high-only` to the command above to list only HIGH files. This also works with reports from earlier scanner versions; use scanner 1.7.1+ to open them.
+
 ### Run as a RunCloud user without root
 
 Scanner **1.6.0+** also runs as an ordinary RunCloud SSH user. Use the same script; no sudo or separate edition is needed. Log in as the account that owns the websites. Check `/usr/bin/python3 --version` (3.6+) and `command -v curl`; ask the server administrator to install missing prerequisites.
@@ -315,7 +317,7 @@ The thresholds are the official 21 October 2026 releases: PHP 8.2.35, 8.3.36, 8.
 **Optional imports from sensors already installed:** replace these example paths with your actual log files. Pass either import option, or both:
 
 ```bash
-/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --zeek-notice /opt/zeek/logs/current/notice.log --suricata-eve /var/log/suricata/eve.json
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --zeek-notice /absolute/path/to/notice.log --suricata-eve /var/log/suricata/eve.json
 ```
 
 Paths must be readable by the invoking account and have no symlink components. Some sensor installations use a `current` symlink: pass the real dated directory instead. Repeat an option for rotated files; `.gz`, `.bz2` and `.xz` are streamed without extraction. One input path can only be assigned one sensor format. Explicit sensor inputs are inspected once and excluded from the ordinary file/log pass. Other sensor rule IDs are ignored; the ignored-record count is reported. Known alerts are imported as review indicators, without claiming that exploitation succeeded or that no other attacks occurred.
@@ -533,7 +535,7 @@ Use `sha256sum /path/to/trusted/release/Session/Storage/NativeSessionStorage.php
 
 ## 6. Quarantine, restore or delete flagged files
 
-When a scan finishes in an interactive SSH terminal, after the summary and any notification, it lists every file with a HIGH or REVIEW finding (log evidence is not listed) and asks which to quarantine:
+By default, when a scan finishes in an interactive SSH terminal, after the summary and any notification, it lists every file with a HIGH or REVIEW finding (log evidence is not listed) and asks which to quarantine:
 
 ```text
    1. HIGH   /home/runcloud/webapps/app/public/x.php  [request_to_execution]
@@ -542,6 +544,22 @@ Quarantine which? Numbers (e.g. 1 3-5), h = all HIGH, a = all, Enter = none:
 ```
 
 Then answer `y` to confirm. Enter, `n`, Ctrl+C or a closed session change nothing. Redirected, piped or scheduled runs never ask; like every run with flagged files, they print the command to use later. The scan's exit code is the same either way.
+
+**Show only HIGH files in SSH (scanner 1.7.1+):** add `--high-only` to the scan command:
+
+```bash
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --high-only
+```
+
+The final quarantine list then excludes REVIEW-only files. A file with both HIGH and REVIEW findings is listed once as HIGH, with all its rules retained. Selection numbers and `a` (all) apply only to the displayed HIGH files; you still choose and confirm before anything moves. If there are no HIGH file findings, it says so and skips selection. All REVIEW findings remain in the report, summary counts and configured callback, and still contribute to the scan's exit code. The option does not affect detection, restore or purge, and does not enable quarantine for user-account scans.
+
+Streambrain offers an unchecked **Show only HIGH files in the SSH quarantine prompt** option. For a background command, add `--high-only` after the scanner path and before `< /dev/null`; the printed command for reopening quarantine keeps that option. It does not change a scan already running, but you can use it when reopening any saved report:
+
+```bash
+/usr/bin/python3 -I /root/runcloud-triage/runcloud-triage.py --quarantine /root/runcloud-triage-SERVER-20261022T120000Z-a1b2c3d4 --high-only
+```
+
+Omit `--high-only` when reopening the report to see both HIGH and REVIEW files again.
 
 If the SSH session closed, or you want to decide later, use the report folder the scan printed. Nothing is scanned again:
 
@@ -637,15 +655,15 @@ python3 -m py_compile runcloud-triage.py
 
 Linux filesystem fixtures test symlink/FIFO handling, age-independent coverage, report generation, compressed logs, limits and read failures. `tests/test_setup.py` checks the README commands in Bash and `/bin/sh` with offline download fixtures, including pasted command boundaries, private permissions, failed downloads and checksum mismatches. Its background fixture verifies that jobs continue after the launching shell exits and a hangup signal arrives, detach all terminal streams, and save exit codes 0/1/2. Run the tests as root in a disposable Linux environment. Detection and timestamp tests can also run on Windows; Linux-specific tests are skipped there. Python 3.6 grammar is checked on interpreters that provide AST grammar selection.
 
-Version 1.6.0 validation includes the Symfony documentation regression and executable calls at the same vendor path, trusted vendor baseline matches/mismatches/unverified coverage, and a complete CLI run after dropping privileges to an ordinary account in an isolated filesystem. The suite also covers binary PHP-tag heuristics, scan exit codes 0/1/2, report permissions, counting/ETA, callback privacy/failures, background hangup handling, setup commands with spaces in home paths, and the existing quarantine safeguards. Notification transport tests use a local HTTP receiver and do not contact external services.
+Version 1.7.0 validation includes optional package assessment, Zeek JSON/TSV and Suricata imports, malformed and oversized records, byte/sample limits, callback privacy, and exclusion of runtime/network findings from quarantine. It also covers the Symfony documentation regression and executable calls at the same vendor path, trusted vendor baseline matches/mismatches/unverified coverage, and complete CLI runs as root and an ordinary account in isolated filesystems. The suite retains checks for binary PHP-tag heuristics, scan exit codes 0/1/2, report permissions, counting/ETA, callback failures, background hangup handling, setup commands with spaces in home paths, and the existing quarantine safeguards. Notification transport tests use a local HTTP receiver and do not contact external services.
 
 Older-runtime validation used packages verified against signed Ubuntu archive metadata in isolated chroots under WSL:
 
 | Ubuntu userspace | Python | Test result |
 | --- | --- | --- |
-| 22.04 (WSL) | 3.10.12 | 82 passed |
-| 18.04 | 3.6.9 | 81 passed; 1 skipped (AST grammar selection needs Python 3.8+) |
-| 20.04 | 3.8.10 | 82 passed |
+| 22.04 (WSL) | 3.10.12 | 99 passed |
+| 18.04 | 3.6.9 | 98 passed; 1 skipped (AST grammar selection needs Python 3.8+) |
+| 20.04 | 3.8.10 | 99 passed |
 
 Both also passed isolated `--help` and Bash/`/bin/sh` setup checks. Ubuntu's curl 7.58.0 and 7.68.0 accept the download options used here. This validates the older userspace and Python APIs; each server's RunCloud configuration, kernel and external HTTPS endpoint still need on-host validation.
 
