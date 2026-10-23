@@ -790,7 +790,7 @@ class LinuxFixtureTests(unittest.TestCase):
         upload = jail / "home/user/webapps/site/wp-content/uploads/review.php"
         upload.parent.mkdir(parents=True)
         upload.write_bytes(sample(b"echo 1;"))
-        high_only_review = subprocess.run([sys.executable, "-c", code, str(jail), "--high-only"] + notify_args,
+        high_only_review = subprocess.run([sys.executable, "-c", code, str(jail)] + notify_args,
                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(high_only_review.returncode, 1, high_only_review.stdout.decode() + high_only_review.stderr.decode())
         self.assertIn(b"No HIGH file findings to quarantine", high_only_review.stdout)
@@ -870,14 +870,14 @@ class SelectionTests(unittest.TestCase):
 
 
 class QuarantineOptionTests(unittest.TestCase):
-    def test_high_only_is_opt_in_for_scans_and_reopening_quarantine(self):
-        self.assertFalse(triage.parse_options([]).high_only)
-        self.assertTrue(triage.parse_options(["--high-only"]).high_only)
-        self.assertTrue(triage.parse_options(["--quarantine", "/root/report", "--high-only"]).high_only)
+    def test_review_is_opt_in_for_scans_and_reopening_quarantine(self):
+        self.assertFalse(triage.parse_options([]).include_review)
+        self.assertTrue(triage.parse_options(["--include-review"]).include_review)
+        self.assertTrue(triage.parse_options(["--quarantine", "/root/report", "--include-review"]).include_review)
         with contextlib.redirect_stderr(io.StringIO()):
             for action in ("--restore", "--purge"):
                 with self.assertRaises(SystemExit):
-                    triage.parse_options([action, "--high-only"])
+                    triage.parse_options([action, "--include-review"])
 
     def test_actions_are_exclusive_and_do_not_take_notification_options(self):
         with contextlib.redirect_stderr(io.StringIO()):
@@ -1102,7 +1102,7 @@ class QuarantineTests(unittest.TestCase):
         shell, upload = self.shell_and_upload()
         self.scan(shell, upload)
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            code = triage.offer_quarantine(str(self.report_dir), self.qdir, ask=self.answers("1", "y"))
+            code = triage.offer_quarantine(str(self.report_dir), self.qdir, ask=self.answers("1", "y"), include_review=True)
         self.assertEqual(code, 0)
         self.assertFalse(shell.exists())
         self.assertTrue(upload.exists())
@@ -1122,7 +1122,7 @@ class QuarantineTests(unittest.TestCase):
     def test_high_only_reopened_prompt_all_selects_only_displayed_high_files(self):
         shell, upload = self.shell_and_upload()
         self.scan(shell, upload)
-        args = triage.parse_options(["--quarantine", str(self.report_dir), "--high-only"])
+        args = triage.parse_options(["--quarantine", str(self.report_dir)])
         # The temporary test quarantine is deliberately outside the scanned fixture home.
         args.quarantine_dir = self.qdir
         with mock.patch.object(triage, "interactive_terminal", return_value=True), \
@@ -1140,27 +1140,43 @@ class QuarantineTests(unittest.TestCase):
         self.scan(upload)
         ask = mock.Mock(side_effect=AssertionError("No HIGH files should mean no prompt"))
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            code = triage.offer_quarantine(str(self.report_dir), self.qdir, ask=ask, high_only=True)
+            code = triage.offer_quarantine(str(self.report_dir), self.qdir, ask=ask)
         self.assertEqual(code, 0)
         self.assertIn("No HIGH file findings", out.getvalue())
         self.assertNotIn(str(upload), out.getvalue())
         ask.assert_not_called()
         self.assertTrue(upload.exists())
 
-    def test_after_scan_preserves_high_only_in_prompt_and_background_reopen_command(self):
+    def test_after_scan_preserves_review_choice_in_prompt_and_background_reopen_command(self):
         shell, upload = self.shell_and_upload()
         self.scan(shell, upload)
-        self.args.high_only = True
         self.args.user_mode = False
         self.args.quarantine_dir = self.qdir
-        for interactive in (True, False):
-            with mock.patch.object(triage, "interactive_terminal", return_value=interactive), \
-                    contextlib.redirect_stdout(io.StringIO()) as out:
-                triage.offer_after_scan(str(self.report_dir), self.args, ask=self.answers(""))
-            self.assertIn("--high-only", out.getvalue())
-            self.assertIn("1 flagged file(s)", out.getvalue())
-            self.assertNotIn(str(upload), out.getvalue())
+        for include_review in (False, True):
+            self.args.include_review = include_review
+            for interactive in (True, False):
+                with mock.patch.object(triage, "interactive_terminal", return_value=interactive), \
+                        contextlib.redirect_stdout(io.StringIO()) as out:
+                    triage.offer_after_scan(str(self.report_dir), self.args, ask=self.answers(""))
+                command = next(line for line in out.getvalue().splitlines() if line.startswith("  /usr/bin/python3"))
+                self.assertEqual("--include-review" in command, include_review)
+                self.assertIn("{} flagged file(s)".format(2 if include_review else 1), out.getvalue())
+                self.assertEqual(str(upload) in out.getvalue(), include_review and interactive)
         self.assertTrue(shell.exists() and upload.exists())
+
+    def test_include_review_reopened_prompt_lists_and_selects_review_files(self):
+        shell, upload = self.shell_and_upload()
+        self.scan(shell, upload)
+        args = triage.parse_options(["--quarantine", str(self.report_dir), "--include-review"])
+        args.quarantine_dir = self.qdir
+        with mock.patch.object(triage, "interactive_terminal", return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = triage.run_quarantine_action(args, ask=self.answers("2", "y"))
+        self.assertEqual(code, 0)
+        self.assertIn(str(shell), out.getvalue())
+        self.assertIn(str(upload), out.getvalue())
+        self.assertTrue(shell.exists())
+        self.assertFalse(upload.exists())
 
     def test_skipping_declining_or_closing_the_prompt_changes_nothing(self):
         shell, upload = self.shell_and_upload()

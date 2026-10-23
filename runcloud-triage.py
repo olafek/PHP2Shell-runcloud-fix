@@ -1203,13 +1203,13 @@ def parser():
     p.add_argument("--log-samples", type=bounded_int, help="Saved excerpts per log; default 200, or 50 with --quick; counting continues")
     actions = p.add_mutually_exclusive_group()
     actions.add_argument("--quarantine", metavar="REPORT_DIR",
-                         help="No scan: choose HIGH/REVIEW files from a previous report and move them into the quarantine")
+                         help="No scan: choose HIGH files from a previous report (add --include-review for REVIEW) and move them into quarantine")
     actions.add_argument("--restore", action="store_true",
                          help="No scan: choose quarantined files and put them back exactly as they were")
     actions.add_argument("--purge", action="store_true",
                          help="No scan: choose quarantined files and permanently delete them")
-    p.add_argument("--high-only", action="store_true",
-                   help="Show only HIGH files in the post-scan or --quarantine selection; reports, callbacks and scan exit codes still include REVIEW")
+    p.add_argument("--include-review", action="store_true",
+                   help="Also list REVIEW files in the post-scan or --quarantine selection (default: HIGH only); reports, callbacks and scan exit codes always include REVIEW")
     p.add_argument("--quarantine-dir", default=QUARANTINE_DIR,
                    help="Root-only quarantine folder outside scanned trees (default " + QUARANTINE_DIR + ")")
     return p
@@ -1235,8 +1235,8 @@ def parse_options(argv=None):
         argument_parser.error("--notify-url applies to scans, not to --quarantine/--restore/--purge")
     if (args.quarantine or args.restore or args.purge) and (args.assess_php or args.zeek_notice or args.suricata_eve):
         argument_parser.error("Optional PHP assessment and sensor imports apply only to scans")
-    if args.high_only and (args.restore or args.purge):
-        argument_parser.error("--high-only applies to the post-scan or --quarantine selection, not --restore/--purge")
+    if args.include_review and (args.restore or args.purge):
+        argument_parser.error("--include-review applies to the post-scan or --quarantine selection, not --restore/--purge")
     args.zeek_notice = list(dict.fromkeys(os.path.abspath(path) for path in args.zeek_notice))
     args.suricata_eve = list(dict.fromkeys(os.path.abspath(path) for path in args.suricata_eve))
     if set(args.zeek_notice) & set(args.suricata_eve):
@@ -1720,18 +1720,18 @@ def confirm_and_apply(items, ask, describe, verb, question, accepted, action):
     return 0
 
 
-def offer_quarantine(report_dir, quarantine_dir, ask=input, candidates=None, high_only=False):
+def offer_quarantine(report_dir, quarantine_dir, ask=input, candidates=None, include_review=False):
     try:
         if candidates is None:
-            candidates = quarantine_candidates(report_dir, high_only=high_only)
+            candidates = quarantine_candidates(report_dir, high_only=not include_review)
     except (OSError, ValueError) as exc:
         print("Cannot read report " + report_dir + ": " + str(exc), file=sys.stderr)
         return 2
-    if high_only:
+    if not include_review:
         candidates = [candidate for candidate in candidates if candidate["severity"] == "HIGH"]
-        print("HIGH-only selection: REVIEW files remain in the report; omit --high-only to include them.")
+        print("Showing HIGH files only. REVIEW files remain in the report; add --include-review to list them too.")
     if not candidates:
-        print("No " + ("HIGH" if high_only else "HIGH/REVIEW") + " file findings to quarantine in " + report_dir + ".")
+        print("No " + ("HIGH/REVIEW" if include_review else "HIGH") + " file findings to quarantine in " + report_dir + ".")
         return 0
     print(f"\n{len(candidates)} flagged file(s). Quarantine moves a file out of its site into {quarantine_dir}, keeping an")
     print("exact copy for --restore. A site that loads the file may show errors until it is restored.")
@@ -1775,21 +1775,21 @@ def offer_after_scan(report_dir, args, ask=input):
     if args.user_mode:
         return
     try:
-        candidates = quarantine_candidates(report_dir, high_only=args.high_only)
+        candidates = quarantine_candidates(report_dir, high_only=not args.include_review)
     except (OSError, ValueError):
         return
     if not candidates:
-        if args.high_only:
-            print("No HIGH file findings to quarantine. REVIEW findings, if any, remain in the report.", flush=True)
+        if not args.include_review:
+            print("No HIGH file findings to quarantine. REVIEW findings, if any, remain in the report; add --include-review to list them too.", flush=True)
         return
     command = "/usr/bin/python3 -I " + shlex.quote(os.path.abspath(__file__)) + " --quarantine " + shlex.quote(report_dir)
-    if args.high_only:
-        command += " --high-only"
+    if args.include_review:
+        command += " --include-review"
     if os.path.abspath(args.quarantine_dir) != QUARANTINE_DIR:
         command += " --quarantine-dir " + shlex.quote(args.quarantine_dir)
     print(f"\n{len(candidates)} flagged file(s) can be quarantined now or later, without scanning again:\n  {command}", flush=True)
     if interactive_terminal():
-        offer_quarantine(report_dir, args.quarantine_dir, ask, candidates, high_only=args.high_only)
+        offer_quarantine(report_dir, args.quarantine_dir, ask, candidates, include_review=args.include_review)
 
 
 def run_quarantine_action(args, ask=input):
@@ -1803,7 +1803,7 @@ def run_quarantine_action(args, ask=input):
     os.umask(0o077)
     quarantine_dir = os.path.abspath(args.quarantine_dir)
     if args.quarantine:
-        return offer_quarantine(os.path.abspath(args.quarantine), quarantine_dir, ask, high_only=args.high_only)
+        return offer_quarantine(os.path.abspath(args.quarantine), quarantine_dir, ask, include_review=args.include_review)
     if args.restore:
         return offer_restore(quarantine_dir, ask)
     return offer_purge(quarantine_dir, ask)
