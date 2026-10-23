@@ -14,7 +14,7 @@ This is a first-pass investigation tool for the PHP vulnerabilities announced on
 
 The public repository is [olafek/PHP2Shell-runcloud-fix](https://github.com/olafek/PHP2Shell-runcloud-fix). The steps below use `curl` inside your server's SSH session to download the scanner and its checksum. No Git installation, repository clone, or GitHub login is needed.
 
-The download example uses `master` to get the latest published scanner. That branch can change between runs. To use the same scanner version on every server, replace `master` in `TRIAGE_REF` in step 3 with the same full commit hash from the repository.
+The download examples pin scanner **1.8.0** to verified commit `f6b9d3cea8ed5930363c8e7842aaa2f1c3e1155d`. Both files come from that exact commit. Mutable `master` URLs can temporarily serve a new script with an older cached checksum, or change between requests. For a newer release, use one full commit hash whose published script/checksum pair has been verified; do not mix references or bypass checksum verification.
 
 ## 2. Log in and check requirements
 
@@ -50,7 +50,7 @@ Paste this entire block as root into a fresh SSH prompt, then press Enter. It wo
     umask 077 &&
     install -d -o root -g root -m 0700 /root/runcloud-triage &&
     cd /root/runcloud-triage &&
-    TRIAGE_REF='master' &&
+    TRIAGE_REF='f6b9d3cea8ed5930363c8e7842aaa2f1c3e1155d' &&
     TRIAGE_RAW_BASE="https://raw.githubusercontent.com/olafek/PHP2Shell-runcloud-fix/$TRIAGE_REF" &&
     curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py" -o runcloud-triage.py &&
     curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py.sha256" -o runcloud-triage.py.sha256 &&
@@ -67,6 +67,8 @@ The parentheses keep `umask` and `cd` inside the block, so afterwards your promp
 **Optional code review:** `less /root/runcloud-triage/runcloud-triage.py` displays the source code; it does not run the scanner. Press `q` to exit and continue to step 4. You do not need to edit the file or open it in `nano`.
 
 The checksum detects transfer/file mismatches. A checksum downloaded from the same repository is **not independent authentication** of that repository.
+
+**If verification says `FAILED`:** do not run that downloaded script. Re-run the complete download block above so both files are replaced from the same verified commit, then require `runcloud-triage.py: OK` before continuing. Do not regenerate the checksum on the server to make an unverified download pass. If the pinned pair still fails, retain the failure output and compare the downloaded bytes before proceeding.
 
 ## 4. Run it
 
@@ -184,7 +186,7 @@ Download into your home directory, outside `webapps`:
     umask 077 &&
     install -d -m 0700 "$HOME/runcloud-triage" &&
     cd "$HOME/runcloud-triage" &&
-    TRIAGE_REF='master' &&
+    TRIAGE_REF='f6b9d3cea8ed5930363c8e7842aaa2f1c3e1155d' &&
     TRIAGE_RAW_BASE="https://raw.githubusercontent.com/olafek/PHP2Shell-runcloud-fix/$TRIAGE_REF" &&
     curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py" -o runcloud-triage.py &&
     curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' "$TRIAGE_RAW_BASE/runcloud-triage.py.sha256" -o runcloud-triage.py.sha256 &&
@@ -701,4 +703,4 @@ $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath ./runcloud-triage.py).Has
 "$digest  runcloud-triage.py" | Set-Content -Encoding ascii ./runcloud-triage.py.sha256
 ```
 
-Preserve the script's bytes when uploading; line-ending changes change its checksum. `.gitattributes` keeps consistent LF line endings across workstations. Publish scanner and checksum updates together. For pinned deployments, select a commit containing both matching files.
+Preserve the script's bytes when uploading; line-ending changes change its checksum. `.gitattributes` keeps consistent LF line endings across workstations. Publish scanner and checksum updates together. After publishing, download both files using that full commit hash and verify the pair. Only then update both `TRIAGE_REF` examples here and Streambrain's `ServerScanReport::SCANNER_REF` to that verified commit. The instructions may be published in a later commit; their pinned download target must contain the matching scanner/checksum pair.

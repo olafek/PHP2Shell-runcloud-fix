@@ -34,6 +34,7 @@ class SetupTests(unittest.TestCase):
         curl = self.bin / "curl"
         curl.write_text(
             "#!/bin/sh\n"
+            "printf '%s\\n' \"$@\" >> \"$CURL_ARGS_LOG\"\n"
             "[ \"$DOWNLOAD_FAIL\" != 1 ] || exit 22\n"
             "while [ \"$#\" -gt 0 ]; do\n"
             "    if [ \"$1\" = '-o' ]; then shift; cp \"$FIXTURE_DIR/$1\" \"$1\"; exit; fi\n"
@@ -45,7 +46,8 @@ class SetupTests(unittest.TestCase):
         chmod.write_text('#!/bin/sh\nprintf called > "$CHMOD_MARKER"\nexec /bin/chmod "$@"\n')
         chmod.chmod(0o700)
         self.env = dict(os.environ, PATH=str(self.bin) + ":/usr/bin:/bin",
-                        FIXTURE_DIR=str(self.fixtures), CHMOD_MARKER=str(self.root / "chmod-called"))
+                        FIXTURE_DIR=str(self.fixtures), CHMOD_MARKER=str(self.root / "chmod-called"),
+                        CURL_ARGS_LOG=str(self.root / "curl-args"))
         self.readme = README.read_text(encoding="utf-8")
 
     def block(self, section):
@@ -57,6 +59,16 @@ class SetupTests(unittest.TestCase):
         command = command.replace("/root/runcloud-triage", str(self.root / "runcloud-triage"))
         return subprocess.run([shell, "-c", command], env=self.env,
                               input=token, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def assert_pinned_downloads(self):
+        refs = re.findall(r"TRIAGE_REF='([a-f0-9]{40})'", self.readme)
+        self.assertEqual(len(refs), 2)
+        self.assertEqual(len(set(refs)), 1)
+        urls = [line for line in (self.root / "curl-args").read_text().splitlines() if line.startswith("https://")]
+        self.assertTrue(urls)
+        for url in urls:
+            self.assertIn("/" + refs[0] + "/", url)
+            self.assertNotIn("/master/", url)
 
     @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "Documented root ownership requires root")
     def test_download_and_token_commands_remain_separate_when_newlines_become_spaces(self):
@@ -73,6 +85,7 @@ class SetupTests(unittest.TestCase):
                              self.root / "runcloud-triage-notify.token"):
                     self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
                 self.assertEqual((self.root / "runcloud-triage-notify.token").read_bytes(), b"dummy-test-token\n")
+                self.assert_pinned_downloads()
 
     @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "Documented root ownership requires root")
     def test_download_failure_or_checksum_mismatch_does_not_finish_setup(self):
@@ -105,6 +118,7 @@ class SetupTests(unittest.TestCase):
             self.assertEqual((directory / "runcloud-triage-notify.token").read_text(), "fixture-token\n")
             self.assertEqual(stat.S_IMODE((directory / "runcloud-triage").stat().st_mode), 0o700)
             self.assertEqual(stat.S_IMODE((directory / "runcloud-triage-notify.token").stat().st_mode), 0o600)
+            self.assert_pinned_downloads()
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "Background launch tests require Linux")
