@@ -3,6 +3,7 @@ import argparse
 import ast
 import bz2
 import contextlib
+import errno
 import gzip
 import hashlib
 import http.server
@@ -475,6 +476,79 @@ class LinuxFixtureTests(unittest.TestCase):
         with mock.patch.object(triage.os, "scandir", side_effect=AssertionError("scandir(fd) requires 3.7")):
             self.assertEqual(len(list(triage.walk_files(str(self.home), self.report))), 1)
 
+    def test_listed_entries_disappearing_remain_visible_as_coverage_gaps(self):
+        vanished = self.write("alice/webapps/site/storage/framework/sessions/expired-session", b"session")
+        cache_dir = self.home / "expired-cache"
+        cache_dir.mkdir()
+        surviving = self.write("alice/webapps/site/storage/framework/sessions/still-present.php", request_sample())
+        original_stat = os.stat
+
+        def remove_before_stat(path, *args, **kwargs):
+            if kwargs.get("dir_fd") is not None:
+                if path == vanished.name:
+                    os.unlink(path, dir_fd=kwargs["dir_fd"])
+                elif path == cache_dir.name:
+                    os.rmdir(path, dir_fd=kwargs["dir_fd"])
+            return original_stat(path, *args, **kwargs)
+
+        with mock.patch.object(triage.os, "stat", side_effect=remove_before_stat):
+            for path, _ in triage.walk_files(str(self.home), self.report):
+                triage.scan_file(path, self.report)
+        self.assertEqual(self.report.gaps["disappeared_during_traversal"], 2)
+        self.assertNotIn("traversal_error", self.report.gaps)
+        self.assertEqual({row["path"] for row in self.rows("coverage")}, {str(vanished), str(cache_dir)})
+        self.assertTrue(all("[Errno 2]" in row["detail"] for row in self.rows("coverage")))
+        self.assertEqual(self.report.severities["HIGH"], 1)  # Session directories still get every file check.
+        self.assertEqual(self.rows("files")[0]["path"], str(surviving))
+
+    def test_directory_disappearing_between_stat_and_open_is_a_coverage_gap(self):
+        directory = self.home / "expired-directory"
+        directory.mkdir()
+        original_open = os.open
+
+        def remove_before_open(path, *args, **kwargs):
+            if path == directory.name and kwargs.get("dir_fd") is not None:
+                os.rmdir(path, dir_fd=kwargs["dir_fd"])
+            return original_open(path, *args, **kwargs)
+
+        with mock.patch.object(triage.os, "open", side_effect=remove_before_open):
+            self.assertEqual(list(triage.walk_files(str(self.home), self.report)), [])
+        self.assertEqual(self.report.gaps["disappeared_during_traversal"], 1)
+        self.assertNotIn("traversal_error", self.report.gaps)
+
+    def test_other_traversal_errors_and_missing_roots_remain_hard_failures(self):
+        blocked = self.write("blocked.php", b"fixture")
+        original_stat = os.stat
+        for error in (errno.EACCES, errno.EPERM, errno.EIO, errno.ENOTDIR, errno.ELOOP):
+            def fail_stat(path, *args, **kwargs):
+                if path == blocked.name and kwargs.get("dir_fd") is not None:
+                    raise OSError(error, "fixture", path)
+                return original_stat(path, *args, **kwargs)
+            with mock.patch.object(triage.os, "stat", side_effect=fail_stat):
+                self.assertEqual(list(triage.walk_files(str(self.home), self.report)), [])
+        self.assertEqual(self.report.gaps["traversal_error"], 5)
+        self.assertNotIn("disappeared_during_traversal", self.report.gaps)
+        self.assertEqual(list(triage.walk_files(str(self.home / "missing-root"), self.report)), [])
+        self.assertEqual(self.report.gaps["root_unavailable"], 1)
+        with mock.patch.object(triage.os, "listdir", side_effect=PermissionError(errno.EACCES, "fixture")):
+            self.assertEqual(list(triage.walk_files(str(self.home), self.report)), [])
+        self.assertEqual(self.report.gaps["directory_read_error"], 1)
+
+    def test_precount_disappearance_does_not_duplicate_coverage(self):
+        entry = self.write("gone-before-stat", b"fixture")
+        original_stat = os.stat
+
+        def missing_stat(path, *args, **kwargs):
+            if path == entry.name and kwargs.get("dir_fd") is not None:
+                raise FileNotFoundError(errno.ENOENT, "fixture", path)
+            return original_stat(path, *args, **kwargs)
+
+        with mock.patch.object(triage.os, "stat", side_effect=missing_stat):
+            self.assertEqual(list(triage.walk_files(str(self.home), self.report, record=False)), [])
+            self.assertFalse(self.report.gaps)
+            self.assertEqual(list(triage.walk_files(str(self.home), self.report)), [])
+        self.assertEqual(self.report.gaps["disappeared_during_traversal"], 1)
+
     def test_does_not_scan_own_output(self):
         (self.out / "existing.txt").write_text("private report")
         self.assertEqual(list(triage.walk_files(str(self.out), self.report)), [])
@@ -758,6 +832,55 @@ class LinuxFixtureTests(unittest.TestCase):
             for artifact in report.iterdir():
                 self.assertEqual(artifact.stat().st_uid, 1001)
                 self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "Isolated chroot CLI test requires root")
+    def test_cli_disappeared_entries_do_not_mask_hard_errors_or_findings(self):
+        jail = self.root / "vanishing-isolated"
+        for relative in ("root", "home/account/webapps/site/storage/framework/sessions", "etc", "tmp"):
+            (jail / relative).mkdir(parents=True, mode=0o700, exist_ok=True)
+        (jail / "runcloud-triage.py").write_bytes(SCRIPT.read_bytes())
+        code = """
+import os, sys, errno, importlib.util, _strptime, encodings.ascii
+spec = importlib.util.spec_from_file_location('triage', sys.argv[1] + '/runcloud-triage.py')
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+failure_errno = int(sys.argv[2])
+original_stat = os.stat
+def stat_after_listing(path, *args, **kwargs):
+    if path == 'expired-session' and kwargs.get('dir_fd') is not None:
+        if failure_errno == errno.ENOENT:
+            os.unlink(path, dir_fd=kwargs['dir_fd'])
+        else:
+            raise OSError(failure_errno, 'fixture', path)
+    return original_stat(path, *args, **kwargs)
+os.chroot(sys.argv[1])
+os.chdir('/')
+m.__file__ = '/runcloud-triage.py'
+m.os.stat = stat_after_listing
+m.send_notification = lambda args, payload, token=None: print('CALLBACK ' + m.json.dumps(payload)) or True
+sys.argv = ['runcloud-triage.py', '--no-precount', '--notify-url', 'https://example.test/hook', '--notify-findings']
+sys.exit(m.main())
+"""
+        session = jail / "home/account/webapps/site/storage/framework/sessions/expired-session"
+        for error, high, expected_exit in ((errno.ENOENT, False, 0), (errno.EACCES, False, 2),
+                                           (errno.EIO, False, 2), (errno.ENOENT, True, 1)):
+            session.write_bytes(b"fixture")
+            if high:
+                (session.parent / "surviving.php").write_bytes(request_sample())
+            result = subprocess.run([sys.executable, "-c", code, str(jail), str(error)],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, expected_exit, result.stdout.decode() + result.stderr.decode())
+            payload = json.loads(next(line[9:] for line in result.stdout.decode().splitlines() if line.startswith("CALLBACK ")))
+            gap = "disappeared_during_traversal" if error == errno.ENOENT else "traversal_error"
+            self.assertEqual(payload["coverage_issues"][gap], 1)
+            self.assertEqual(payload["status"], {0: "completed", 1: "review_required", 2: "incomplete"}[expected_exit])
+            self.assertTrue(payload["scan_finished"] and payload["report_finalized"])
+            report = jail / "root" / payload["run_id"]
+            coverage = [json.loads(line) for line in (report / "coverage.jsonl").read_text().splitlines()]
+            [entry] = [row for row in coverage if row["reason"] == gap]
+            self.assertTrue(entry["path"].endswith("/expired-session"))
+            if high:
+                self.assertEqual(payload["indicators"]["HIGH"], 1)
 
     @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "Isolated chroot CLI test requires root")
     def test_full_cli_in_isolated_filesystem(self):

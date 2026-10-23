@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 MIB = 1024 * 1024
 # Not named runcloud-triage-* so it is never mistaken for (or globbed with) a report folder.
 QUARANTINE_DIR = "/root/runcloud-quarantine"
@@ -536,7 +536,11 @@ def walk_files(root, report, record=True):
                     else:
                         gap(child, "non_regular_file_not_read", stat.filemode(st.st_mode))
                 except OSError as exc:
-                    gap(child, "traversal_error", exc)
+                    # A name returned by listdir can disappear before stat/open/readlink
+                    # on a live site. Retain the gap, without treating ENOENT as a hard
+                    # traversal failure. Missing roots and all other errors stay hard.
+                    reason = "disappeared_during_traversal" if exc.errno == errno.ENOENT else "traversal_error"
+                    gap(child, reason, exc)
         except OSError as exc:
             gap(path, "directory_read_error", exc)
 
